@@ -1,0 +1,12 @@
+version: 1
+defaultProfile: vm-smoke
+profiles:
+  vm-smoke:
+    backend: vm
+    network: full
+    workspace:
+      mode: live
+    resources:
+      memoryMiB: 6144
+      vcpus: 4
+      diskGiB: 40

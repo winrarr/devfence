@@ -1,0 +1,10 @@
+/devfence
+/coverage.out
+/coverage.html
+/dist/
+.env
+.env.*
+!.env.example
+*.token
+*.pem
+*.key

@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+if [ -r /run/secrets/github-token ]; then
+    GH_TOKEN="$(cat /run/secrets/github-token)"
+    export GH_TOKEN
+fi
+exec "$@"
