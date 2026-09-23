@@ -22,3 +22,10 @@ Items are goals with testable outcomes; implementation choices remain open to ev
 - Rationale: explicit session deletion is safe but easy to forget when multiple projects are open concurrently.
 - Constraints: default to preview; never infer that a VM disk or session home is disposable from Git cleanliness alone; account for active runtime and editor connections.
 - Acceptance: a dry run explains every retain/delete decision; automatic deletion is limited to sessions whose workspace, Git upstream state, home, runtime, and attachments are all verifiably clean, and unknown state always retains the session.
+
+## Support live single-file project shares
+
+- Goal: let a project expose one host file directly at a sandbox-home-relative target, with read-only or read-write access.
+- Rationale: directory mounts work for shared configuration trees, while a single settings file may be the only host file an agent needs to edit.
+- Constraints: keep the same explicit approval and exact-request invalidation rules as directory shares; refuse unsafe parent paths and symlink substitution; implement equivalent behavior in Bubblewrap, rootless Docker, and VM sessions.
+- Acceptance: backend tests prove a live single-file share reaches the requested target, honors both access modes, and never copies or exposes sibling files.

@@ -1,45 +1,7 @@
-version: 1
-defaultProfile: personal
+version: 3
 
-profiles:
-  personal:
-    backend: bubblewrap
-    network: full
-    workspace:
-      mode: live
-
-  container:
-    backend: docker
-    network: full
-    workspace:
-      mode: live
-
-  protected-copy:
-    backend: vm
-    network: full
-    workspace:
-      mode: copy
-      include:
-        - README.md
-        - go.mod
-        - go.sum
-        - '*.go'
-        - '**/*.go'
-    credentials:
-      sshKey: ~/.ssh/work-project-key
-      githubTokenCommand:
-        - gh
-        - auth
-        - token
-
-rules:
-  - path: ~/projects/protected
-    match: subtree
-    profile: protected-copy
-  - path: ~/projects/containers
-    match: subtree
-    profile: container
-
-protectedPaths:
-  - ~/Documents/work
-  - ~/.ssh/work-project-key
+defaults:
+  backend: bubblewrap
+  network: full
+  workspace:
+    mode: live

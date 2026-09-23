@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +30,7 @@ func TestBubblewrapClearsHostEnvironmentAndIsolatesHomeAndNetwork(t *testing.T) 
 		WorkspaceMode:      "live",
 		HomeDir:            filepath.Join(root, "session-home"),
 	}
-	args, err := bubblewrapArgs(session, resolved, []string{"codex"})
+	args, err := bubblewrapArgs(session, resolved, []string{"codex"}, nil, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,12 +57,708 @@ func TestBubblewrapFullNetworkIsExplicit(t *testing.T) {
 	args, err := bubblewrapArgs(&Session{
 		SourceWorkspace: workspace, PresentedWorkspace: workspace,
 		WorkingDir: workspace, WorkspaceMode: "live", HomeDir: filepath.Join(root, "home"),
-	}, Resolved{Profile: Profile{Network: "full"}}, []string{"sh"})
+	}, Resolved{Profile: Profile{Network: "full"}}, []string{"sh"}, nil, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !containsArg(args, "--share-net") {
 		t.Fatal("network:full must explicitly share the host network namespace")
+	}
+}
+
+func TestBubblewrapCopiesSystemdResolverIntoPrivateRun(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "project")
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	target := "/run/systemd/resolve/stub-resolv.conf"
+	args, err := bubblewrapArgs(&Session{
+		SourceWorkspace: workspace, PresentedWorkspace: workspace,
+		WorkingDir: workspace, WorkspaceMode: "live", HomeDir: filepath.Join(root, "home"),
+	}, Resolved{Profile: Profile{Network: "full"}}, []string{"sh"}, nil, target, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpfsIndex := -1
+	fileIndex := -1
+	for index := range args {
+		if index+1 < len(args) && args[index] == "--tmpfs" && args[index+1] == "/run" {
+			tmpfsIndex = index
+		}
+		if index+2 < len(args) && args[index] == "--file" && args[index+1] == "4" && args[index+2] == target {
+			fileIndex = index
+		}
+	}
+	if tmpfsIndex < 0 || fileIndex <= tmpfsIndex {
+		t.Fatalf("resolver file must be copied into private /run after it is created: %v", args)
+	}
+	if hasTriple(args, "--ro-bind", target, target) {
+		t.Fatalf("host resolver path must not be looked up after /run is hidden: %v", args)
+	}
+}
+
+func TestBubblewrapMountsConfiguredHostCodexReadOnly(t *testing.T) {
+	bin := t.TempDir()
+	release := filepath.Join(bin, "releases", "codex-version")
+	if err := os.MkdirAll(filepath.Join(release, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(release, "codex-resources"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(release, "codex-package.json"), []byte(`{"name":"codex"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(release, "bin", "codex"), "#!/bin/sh\nexit 0\n")
+	codexPath := filepath.Join(bin, "codex")
+	if err := os.Symlink(filepath.Join(release, "bin", "codex"), codexPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	root := t.TempDir()
+	workspace := filepath.Join(root, "project")
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	install, err := hostToolInstallation("codex", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := bubblewrapArgs(&Session{
+		SourceWorkspace: workspace, PresentedWorkspace: workspace,
+		WorkingDir: workspace, WorkspaceMode: "live", HomeDir: filepath.Join(root, "home"),
+	}, Resolved{Profile: Profile{Network: "none", Tools: ToolPolicy{Codex: ForwardedToolPolicy{Enabled: true}}}}, []string{"codex"}, []*hostToolInstall{install}, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTriple(args, "--ro-bind", release, "/opt/devfence/codex") {
+		t.Fatalf("the full host Codex release was not mounted read-only: %v", args)
+	}
+	if !hasTriple(args, "--symlink", "/opt/devfence/codex/bin/codex", "/opt/devfence/bin/codex") {
+		t.Fatalf("the Codex command was not linked into the sandbox tool path: %v", args)
+	}
+}
+
+func TestBubblewrapMountsHostNodeCodexPackageAndRuntime(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	packageRoot := filepath.Join(root, "node_modules", "@openai", "codex")
+	if err := os.MkdirAll(filepath.Join(packageRoot, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte(`{"name":"@openai/codex","dependencies":{"@openai/codex-linux-x64":"1.0.0"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(packageRoot, "bin", "codex.js"), "#!/usr/bin/env node\n")
+	dependencyRoot := filepath.Join(root, "node_modules", "@openai", "codex-linux-x64")
+	if err := os.MkdirAll(dependencyRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dependencyRoot, "package.json"), []byte(`{"name":"@openai/codex-linux-x64"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedRoot := filepath.Join(root, "node_modules", "unrelated-tool")
+	if err := os.MkdirAll(unrelatedRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unrelatedRoot, "package.json"), []byte(`{"name":"unrelated-tool"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	codexPath := filepath.Join(bin, "codex")
+	if err := os.Symlink(filepath.Join(packageRoot, "bin", "codex.js"), codexPath); err != nil {
+		t.Fatal(err)
+	}
+	nodePath := filepath.Join(bin, "node")
+	writeExecutable(t, nodePath, "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", bin)
+
+	install, err := hostToolInstallation("codex", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if install == nil || install.source != packageRoot || install.nodeRuntime != nodePath || install.entryPoint != filepath.Join("bin", "codex.js") {
+		t.Fatalf("resolved host Node package = %+v", install)
+	}
+	workspace := filepath.Join(root, "project")
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	args, err := bubblewrapArgs(&Session{
+		SourceWorkspace: workspace, PresentedWorkspace: workspace,
+		WorkingDir: workspace, WorkspaceMode: "live", HomeDir: filepath.Join(root, "home"),
+	}, Resolved{Profile: Profile{Network: "none", Tools: ToolPolicy{Codex: ForwardedToolPolicy{Enabled: true}}}}, []string{"codex"}, []*hostToolInstall{install}, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTriple(args, "--ro-bind", packageRoot, "/opt/devfence/codex") {
+		t.Fatalf("Node package directory was not mounted read-only: %v", args)
+	}
+	if !hasTriple(args, "--ro-bind", nodePath, "/opt/devfence/node/bin/node") {
+		t.Fatalf("host Node runtime was not mounted read-only: %v", args)
+	}
+	if !hasTriple(args, "--ro-bind", dependencyRoot, "/opt/devfence/node_modules/@openai/codex-linux-x64") {
+		t.Fatalf("declared Codex Node dependency was not mounted: %v", args)
+	}
+	if strings.Contains(strings.Join(args, "\x00"), unrelatedRoot) {
+		t.Fatalf("unrelated host Node package was mounted: %v", args)
+	}
+	if !strings.Contains(strings.Join(args, "\x00"), "/opt/devfence/node/bin:/opt/devfence/bin:") {
+		t.Fatalf("host Node runtime and Codex are not in PATH: %v", args)
+	}
+	if !hasTriple(args, "--setenv", "NODE_PATH", "/opt/devfence/node_modules") {
+		t.Fatalf("Codex dependency directory is not in NODE_PATH: %v", args)
+	}
+}
+
+func TestStartedCodexSeesGlobalInstructionsInsideBubblewrap(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("Bubblewrap is not installed")
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skip("Codex CLI is not installed")
+	}
+	if err := execCommand("codex", "debug", "prompt-input", "Report the global marker.").Run(); err != nil {
+		t.Skipf("installed Codex CLI does not support debug prompt rendering: %v", err)
+	}
+	root := t.TempDir()
+	workspace := filepath.Join(root, "project")
+	agentSource := filepath.Join(root, "agents")
+	if err := os.MkdirAll(filepath.Join(workspace), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(agentSource, ".env"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	instructions := filepath.Join(root, "global-instructions.md")
+	marker := "DEVFENCE_GLOBAL_INSTRUCTIONS_83e14a6c"
+	secretMarker := "DEVFENCE_EXCLUDED_SECRET_70f91d2b"
+	if err := os.WriteFile(instructions, []byte("Always include this marker in your answer: "+marker), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentSource, ".env", "secret"), []byte(secretMarker), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sessionDir := filepath.Join(root, "session")
+	if err := os.Mkdir(sessionDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(sessionDir, "home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(home, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			mode := os.FileMode(0600)
+			if entry.IsDir() {
+				mode = 0700
+			}
+			_ = os.Chmod(path, mode)
+			return nil
+		})
+	})
+	profile := Profile{Backend: BackendBubblewrap, Network: "none", Workspace: WorkspacePolicy{Mode: "live"}, Tools: ToolPolicy{
+		Codex:             ForwardedToolPolicy{Enabled: true, Configuration: []ForwardedFile{{Source: instructions, Target: ".codex/AGENTS.md"}}},
+		SharedDirectories: []ForwardedPath{{Source: agentSource, Target: "agents", Exclude: []string{".env"}}},
+	}}
+	if err := prepareForwardedTools(&Session{Backend: BackendBubblewrap, HomeDir: home}, profile); err != nil {
+		t.Fatal(err)
+	}
+	install, err := hostToolInstallation("codex", true)
+	if err != nil || install == nil {
+		t.Fatalf("locate host Codex CLI: install=%#v err=%v", install, err)
+	}
+	args, err := bubblewrapArgs(&Session{
+		SourceWorkspace: workspace, PresentedWorkspace: workspace, WorkingDir: workspace,
+		WorkspaceMode: "live", HomeDir: home, SessionDir: sessionDir,
+	}, Resolved{Workspace: workspace, Profile: profile}, []string{"codex", "debug", "prompt-input", "Report the global marker."}, []*hostToolInstall{install}, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := execCommand("bwrap", args...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		if strings.Contains(strings.ToLower(string(output)), "operation not permitted") || strings.Contains(strings.ToLower(string(output)), "namespace") {
+			t.Skipf("Bubblewrap namespaces are unavailable in this environment: %s", output)
+		}
+		t.Fatalf("run Codex prompt inspection in Bubblewrap: %v\n%s", err, output)
+	}
+	if !bytes.Contains(output, []byte(marker)) {
+		t.Fatalf("started Codex did not receive the global instructions marker:\n%s", output)
+	}
+	if bytes.Contains(output, []byte(secretMarker)) {
+		t.Fatalf("excluded .env content reached Codex's prompt input:\n%s", output)
+	}
+}
+
+func TestProjectShareSnapshotIsStagedForVMWithoutHostCLIInstallation(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "agent-guidance")
+	if err := os.MkdirAll(filepath.Join(source, ".env"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "AGENTS.md"), []byte("follow global instructions"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, ".env", "secret"), []byte("hidden"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "session", "home")
+	if err := os.MkdirAll(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	profile := Profile{ProjectShares: []ProjectShare{{Source: source, Target: "agents", Mode: "copy", Exclude: []string{".env"}}}}
+	if err := prepareForwardedTools(&Session{Backend: BackendVM, HomeDir: home}, profile); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(home, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			if entry.IsDir() {
+				_ = os.Chmod(path, 0700)
+			} else {
+				_ = os.Chmod(path, 0600)
+			}
+			return nil
+		})
+	})
+	if _, err := os.Stat(filepath.Join(home, ".devfence")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("host CLI installation was copied into VM session: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "agents", ".env")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("excluded .env directory was staged: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(home, "agents", "AGENTS.md")); err != nil || string(data) != "follow global instructions" {
+		t.Fatalf("global instructions were not staged: %q, %v", data, err)
+	}
+	entries, err := forwardedSyncEntries(home, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].target != "agents" || !entries[0].directory || !entries[0].readOnly || entries[1].target != "agents/AGENTS.md" || !entries[1].readOnly {
+		t.Fatalf("VM sync entries do not include the read-only project copy: %#v", entries)
+	}
+}
+
+func TestVMSyncIncludesCopiedProjectFileAsReadOnly(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "settings.json"), []byte("snapshot"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	profile := Profile{ProjectShares: []ProjectShare{{Source: "/host/settings.json", Target: "settings.json", Mode: "copy"}}}
+	entries, err := forwardedSyncEntries(home, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].target != "settings.json" || entries[0].directory || !entries[0].readOnly {
+		t.Fatalf("copied project file sync entry = %#v", entries)
+	}
+}
+
+func TestGlobalCodexInstructionsAndFilteredAgentDirectoryReachEveryBackendHome(t *testing.T) {
+	root := t.TempDir()
+	instructions := filepath.Join(root, "global-instructions.md")
+	agents := filepath.Join(root, "agents")
+	if err := os.MkdirAll(filepath.Join(agents, ".env"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructions, []byte("global instruction marker"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agents, "AGENTS.md"), []byte("shared agents"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agents, ".env", "secret"), []byte("host only"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profile := Profile{Tools: ToolPolicy{
+		Codex:             ForwardedToolPolicy{Enabled: true, Configuration: []ForwardedFile{{Source: instructions, Target: ".codex/AGENTS.md"}}},
+		SharedDirectories: []ForwardedPath{{Source: agents, Target: "agents", Exclude: []string{".env"}}},
+	}}
+	for _, backend := range []Backend{BackendBubblewrap, BackendDocker, BackendVM} {
+		t.Run(string(backend), func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), "home")
+			if err := os.Mkdir(home, 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = filepath.WalkDir(home, func(path string, entry os.DirEntry, walkErr error) error {
+					if walkErr != nil {
+						return nil
+					}
+					mode := os.FileMode(0600)
+					if entry.IsDir() {
+						mode = 0700
+					}
+					_ = os.Chmod(path, mode)
+					return nil
+				})
+			})
+			if err := prepareForwardedTools(&Session{Backend: backend, HomeDir: home}, profile); err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(filepath.Join(home, ".codex", "AGENTS.md")); err != nil || string(data) != "global instruction marker" {
+				t.Fatalf("Codex discovery file missing from isolated HOME: %q, err=%v", data, err)
+			}
+			if _, err := os.Stat(filepath.Join(home, "agents", ".env")); !os.IsNotExist(err) {
+				t.Fatalf("host-only .env directory reached isolated HOME: %v", err)
+			}
+			if backend == BackendVM {
+				entries, err := forwardedSyncEntries(home, profile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				foundInstructions, foundAgents := false, false
+				for _, entry := range entries {
+					foundInstructions = foundInstructions || entry.target == ".codex/AGENTS.md"
+					foundAgents = foundAgents || entry.target == "agents/AGENTS.md"
+					if strings.Contains(entry.target, ".env") {
+						t.Fatalf("VM sync included excluded path %s", entry.target)
+					}
+				}
+				if !foundInstructions || !foundAgents {
+					t.Fatalf("VM sync omitted Codex/global files: %#v", entries)
+				}
+			}
+		})
+	}
+}
+
+func TestNodeCodexDependencyConflictsFailClosed(t *testing.T) {
+	root := t.TempDir()
+	packageRoot := filepath.Join(root, "node_modules", "@openai", "codex")
+	alternateRoot := filepath.Join(root, "alternate", "node_modules")
+	packages := map[string]string{
+		packageRoot: `{"name":"@openai/codex","dependencies":{"bar":"1","foo":"1"}}`,
+		filepath.Join(root, "node_modules", "bar"):    `{"name":"bar","dependencies":{"shared":"1"}}`,
+		filepath.Join(root, "node_modules", "shared"): `{"name":"shared","version":"1"}`,
+		filepath.Join(alternateRoot, "foo"):           `{"name":"foo","dependencies":{"shared":"2"}}`,
+		filepath.Join(alternateRoot, "shared"):        `{"name":"shared","version":"2"}`,
+	}
+	for path, manifest := range packages {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "package.json"), []byte(manifest), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(alternateRoot, "foo"), filepath.Join(root, "node_modules", "foo")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodePackageDependencyClosure(packageRoot); err == nil || !strings.Contains(err.Error(), "conflicting installed versions") {
+		t.Fatalf("dependency closure error = %v, want conflicting installed versions", err)
+	}
+}
+
+func hasTriple(args []string, first, second, third string) bool {
+	for index := 0; index+2 < len(args); index++ {
+		if args[index] == first && args[index+1] == second && args[index+2] == third {
+			return true
+		}
+	}
+	return false
+}
+
+func TestForwardedCodexAuthenticationIsCopiedIntoSessionHome(t *testing.T) {
+	root := t.TempDir()
+	hostCodexHome := filepath.Join(root, "host-codex")
+	if err := os.Mkdir(hostCodexHome, 0700); err != nil {
+		t.Fatal(err)
+	}
+	authPath := filepath.Join(hostCodexHome, "auth.json")
+	if err := os.WriteFile(authPath, []byte("secret-auth-value"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "session-home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	policy := forwardedFilePolicy{auth: true, file: ForwardedFile{Source: authPath, Target: ".codex/auth.json"}}
+	if err := stageForwardedFile(home, policy); err != nil {
+		t.Fatal(err)
+	}
+	copyPath := filepath.Join(home, ".codex", "auth.json")
+	data, err := os.ReadFile(copyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "secret-auth-value" {
+		t.Fatal("forwarded Codex authentication copy has different contents")
+	}
+	info, err := os.Stat(copyPath)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("forwarded Codex auth mode = %v, err=%v", info, err)
+	}
+}
+
+func TestCodexAuthRejectsGroupReadableFile(t *testing.T) {
+	root := t.TempDir()
+	authPath := filepath.Join(root, "auth.json")
+	if err := os.WriteFile(authPath, []byte("secret"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(authPath, 0640); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageForwardedFile(home, forwardedFilePolicy{auth: true, file: ForwardedFile{Source: authPath, Target: "auth.json"}}); err == nil {
+		t.Fatal("group-readable Codex auth file was accepted")
+	}
+}
+
+func TestForwardedDirectorySnapshotIsReadOnly(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "agents")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "reviewer.md"), []byte("agent"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("reviewer.md", filepath.Join(source, "reviewer-link.md")); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "session-home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageForwardedDirectory(home, ForwardedPath{Source: source, Target: "agents"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(home, "agents"), 0700) })
+	for _, name := range []string{"reviewer.md", "reviewer-link.md"} {
+		path := filepath.Join(home, "agents", name)
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != "agent" {
+			t.Fatalf("forwarded %s content=%q err=%v", name, data, err)
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm()&0222 != 0 {
+			t.Fatalf("forwarded %s should be read-only: info=%v err=%v", name, info, err)
+		}
+	}
+	info, err := os.Stat(filepath.Join(home, "agents"))
+	if err != nil || info.Mode().Perm()&0222 != 0 {
+		t.Fatalf("forwarded agent directory should be read-only: info=%v err=%v", info, err)
+	}
+}
+
+func TestForwardedDirectoryExcludesSensitiveSubtreeAndKeepsInstructions(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "agents")
+	secretDir := filepath.Join(source, ".env")
+	if err := os.MkdirAll(secretDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		filepath.Join(source, "AGENTS.md"):      "follow these instructions",
+		filepath.Join(secretDir, "credentials"): "private value",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	home := filepath.Join(root, "session-home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	policy := ForwardedPath{Source: source, Target: "agents", Exclude: []string{".env"}}
+	if err := stageForwardedDirectory(home, policy); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(home, "agents"), 0700) })
+	if data, err := os.ReadFile(filepath.Join(home, "agents", "AGENTS.md")); err != nil || string(data) != "follow these instructions" {
+		t.Fatalf("global instructions were not forwarded: content=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "agents", ".env")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("excluded .env directory was forwarded: err=%v", err)
+	}
+}
+
+func TestForwardedDirectoryRejectsSymlinkEscapingSource(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "agents")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.md")
+	if err := os.WriteFile(outside, []byte("outside"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(source, "outside.md")); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "session-home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageForwardedDirectory(home, ForwardedPath{Source: source, Target: "agents"}); err == nil {
+		t.Fatal("forwarding a symlink outside the source directory was accepted")
+	}
+}
+
+func TestProjectCopySnapshotsFileAndDirectoryAndMountLeavesOnlyMountPoint(t *testing.T) {
+	root := t.TempDir()
+	fileSource := filepath.Join(root, "config.json")
+	if err := os.WriteFile(fileSource, []byte("host value"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	directorySource := filepath.Join(root, "agents")
+	if err := os.MkdirAll(filepath.Join(directorySource, ".env"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directorySource, "AGENTS.md"), []byte("instructions"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directorySource, ".env", "secret"), []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mountSource := filepath.Join(root, "mount-source")
+	if err := os.Mkdir(mountSource, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mountSource, "sentinel"), []byte("host"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "session-home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	profile := Profile{ProjectShares: []ProjectShare{
+		{Source: fileSource, Target: "config/settings.json", Mode: "copy"},
+		{Source: directorySource, Target: "agents", Mode: "copy", Exclude: []string{".env"}},
+		{Source: mountSource, Target: "live", Mode: "mount", Access: "read-write"},
+	}}
+	if err := prepareForwardedTools(&Session{Backend: BackendBubblewrap, HomeDir: home}, profile); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(home, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			mode := os.FileMode(0600)
+			if entry.IsDir() {
+				mode = 0700
+			}
+			_ = os.Chmod(path, mode)
+			return nil
+		})
+	})
+	copyFile := filepath.Join(home, "config", "settings.json")
+	if data, err := os.ReadFile(copyFile); err != nil || string(data) != "host value" {
+		t.Fatalf("copy share file contents = %q, err=%v", data, err)
+	}
+	if info, err := os.Stat(copyFile); err != nil || info.Mode().Perm()&0222 != 0 || info.Mode().Perm()&0111 == 0 {
+		t.Fatalf("copied file mode = %v, err=%v", info, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(home, "agents", "AGENTS.md")); err != nil || string(data) != "instructions" {
+		t.Fatalf("copy share directory contents = %q, err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "agents", ".env")); !os.IsNotExist(err) {
+		t.Fatalf("excluded .env directory exists in copy: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "live", "sentinel")); !os.IsNotExist(err) {
+		t.Fatalf("live mount contents were copied into its mount point: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mountSource, "sentinel")); err != nil {
+		t.Fatalf("live mount source was modified: %v", err)
+	}
+}
+
+func TestBubblewrapProjectSharesUseRequestedReadAndWriteModes(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "project")
+	home := filepath.Join(root, "home")
+	copySource := filepath.Join(root, "copied")
+	readOnlySource := filepath.Join(root, "readonly")
+	readWriteSource := filepath.Join(root, "readwrite")
+	for _, path := range []string{workspace, home, copySource, readOnlySource, readWriteSource} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, target := range []string{"snapshot", "live-ro", "live-rw"} {
+		if err := os.Mkdir(filepath.Join(home, target), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shares := []ProjectShare{
+		{Source: copySource, Target: "snapshot", Mode: "copy"},
+		{Source: readOnlySource, Target: "live-ro", Mode: "mount"},
+		{Source: readWriteSource, Target: "live-rw", Mode: "mount", Access: "read-write"},
+	}
+	args, err := bubblewrapArgs(&Session{
+		SourceWorkspace: workspace, PresentedWorkspace: workspace, WorkingDir: workspace,
+		WorkspaceMode: "live", HomeDir: home,
+	}, Resolved{Profile: Profile{Network: "none", ProjectShares: shares}}, []string{"sh"}, nil, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTriple(args, "--ro-bind", filepath.Join(home, "snapshot"), "/home/devfence/snapshot") {
+		t.Fatalf("copied share is not read-only in Bubblewrap: %v", args)
+	}
+	if !hasTriple(args, "--ro-bind", readOnlySource, "/home/devfence/live-ro") {
+		t.Fatalf("read-only live mount is not read-only in Bubblewrap: %v", args)
+	}
+	if !hasTriple(args, "--bind", readWriteSource, "/home/devfence/live-rw") {
+		t.Fatalf("read-write live mount is not writable in Bubblewrap: %v", args)
+	}
+}
+
+func TestBubblewrapMountsSharedAgentDirectoryReadOnlyAndMasksImConfigHook(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "project")
+	if err := os.Mkdir(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "session-home")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	agents := filepath.Join(home, "agents")
+	if err := os.Mkdir(agents, 0500); err != nil {
+		t.Fatal(err)
+	}
+	profile := Profile{Network: "none", Tools: ToolPolicy{SharedDirectories: []ForwardedPath{{Source: "~/agents", Target: "agents"}}}}
+	args, err := bubblewrapArgs(&Session{
+		SourceWorkspace: workspace, PresentedWorkspace: workspace,
+		WorkingDir: workspace, WorkspaceMode: "live", HomeDir: home,
+	}, Resolved{Profile: profile}, []string{"bash", "-lc", "true"}, nil, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTriple(args, "--ro-bind", agents, "/home/devfence/agents") {
+		t.Fatalf("Bubblewrap did not mount agent files read-only: %v", args)
+	}
+	if _, err := os.Stat("/etc/profile.d/im-config_wayland.sh"); err == nil {
+		if !hasTriple(args, "--ro-bind", "/dev/null", "/etc/profile.d/im-config_wayland.sh") {
+			t.Fatalf("Bubblewrap did not mask the host journal profile hook: %v", args)
+		}
+	}
+}
+
+func TestPrivateTerminalRemovalKeepsCommandArguments(t *testing.T) {
+	args := []string{"--new-session", "--", "command", "--new-session"}
+	got := withoutOptionBeforeCommand(args, "--new-session")
+	want := []string{"--", "command", "--new-session"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("filtered Bubblewrap args = %q, want %q", got, want)
 	}
 }
 
@@ -155,14 +852,23 @@ printf '%s\0' "$@" > "$DOCKER_ARGS"
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("DOCKER_ARGS", argsPath)
 	root := t.TempDir()
+	homeDir := filepath.Join(root, "session", "home")
+	agentsDir := filepath.Join(homeDir, "agents")
+	if err := os.MkdirAll(homeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(agentsDir, 0500); err != nil {
+		t.Fatal(err)
+	}
 	session := &Session{
 		ID: "container-test", ContainerName: "devfence-container-test",
 		PresentedWorkspace: filepath.Join(root, "workspace"), SessionDir: filepath.Join(root, "session"),
-		HomeDir: filepath.Join(root, "session", "home"), SSHAgentDir: filepath.Join(root, "session", "ssh-agent"),
+		HomeDir: homeDir, SSHAgentDir: filepath.Join(root, "session", "ssh-agent"),
 		SourceWorkspace: filepath.Join(root, "source"), WorkingDir: filepath.Join(root, "source"),
 		Network: "full",
 	}
-	if err := createContainer(session, Resolved{Profile: Profile{}}); err != nil {
+	profile := Profile{Tools: ToolPolicy{Codex: ForwardedToolPolicy{Enabled: true}, SharedDirectories: []ForwardedPath{{Source: "~/agents", Target: "agents"}}}}
+	if err := createContainer(session, Resolved{Profile: profile}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(argsPath)
@@ -171,18 +877,80 @@ printf '%s\0' "$@" > "$DOCKER_ARGS"
 	}
 	args := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
 	joined := strings.Join(args, " ")
-	for _, forbidden := range []string{"/var/run/docker.sock", "/run/docker.sock", os.Getenv("HOME")} {
+	for _, forbidden := range []string{"/var/run/docker.sock", "/run/docker.sock"} {
 		if forbidden != "" && strings.Contains(joined, forbidden) {
 			t.Errorf("container mounts forbidden host path %q: %s", forbidden, joined)
 		}
+	}
+	if home := os.Getenv("HOME"); home != "" && strings.Contains(joined, "type=bind,src="+home+",") {
+		t.Fatalf("container mounted the host home: %s", joined)
 	}
 	for _, required := range []string{"--cap-drop ALL", "--security-opt no-new-privileges:true", "type=bind,src=" + session.PresentedWorkspace + ",dst=/workspace", "--network bridge"} {
 		if !strings.Contains(joined, required) {
 			t.Errorf("container arguments missing %q: %s", required, joined)
 		}
 	}
+	if !strings.Contains(joined, "type=bind,src="+agentsDir+",dst=/home/devfence/agents,readonly") {
+		t.Fatalf("container did not mount the shared agent directory read-only: %s", joined)
+	}
+	if containsArg(args, "--user") {
+		t.Fatalf("rootless container must use container root to map to the host user, not pass host numeric IDs: %s", joined)
+	}
+	if strings.Contains(joined, ".devfence/bin") || strings.Contains(joined, "NODE_PATH=") {
+		t.Fatalf("container runtime still refers to copied host CLI installations: %s", joined)
+	}
 	if containsArg(args, "--privileged") {
 		t.Fatal("rootless container must not be privileged")
+	}
+}
+
+func TestDockerProjectSharesEnforceCopyReadOnlyAndLiveMountAccess(t *testing.T) {
+	bin := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "args")
+	writeExecutable(t, filepath.Join(bin, "docker"), "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$DOCKER_ARGS\"\n")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_ARGS", argsPath)
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session")
+	home := filepath.Join(sessionDir, "home")
+	copyTarget := filepath.Join(home, "snapshot", "settings.json")
+	readOnlyMount := filepath.Join(root, "host-ro")
+	readWriteMount := filepath.Join(root, "host-rw")
+	for _, path := range []string{filepath.Dir(copyTarget), home, filepath.Join(home, "live-ro"), filepath.Join(home, "live-rw"), filepath.Join(sessionDir, "credentials"), readOnlyMount, readWriteMount} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(copyTarget, []byte("snapshot"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{
+		ID: "container-share-test", ContainerName: "devfence-container-share-test",
+		PresentedWorkspace: filepath.Join(root, "workspace"), SessionDir: sessionDir,
+		HomeDir: home, SourceWorkspace: filepath.Join(root, "source"), WorkingDir: filepath.Join(root, "source"), Network: "full",
+	}
+	profile := Profile{ProjectShares: []ProjectShare{
+		{Source: filepath.Join(root, "unused-copy-source"), Target: "snapshot/settings.json", Mode: "copy"},
+		{Source: readOnlyMount, Target: "live-ro", Mode: "mount"},
+		{Source: readWriteMount, Target: "live-rw", Mode: "mount", Access: "read-write"},
+	}}
+	if err := createContainer(session, Resolved{Profile: profile}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.ReplaceAll(string(data), "\x00", " ")
+	wants := []string{
+		"type=bind,src=" + copyTarget + ",dst=/home/devfence/snapshot/settings.json,readonly",
+		"type=bind,src=" + readOnlyMount + ",dst=/home/devfence/live-ro,readonly",
+		"type=bind,src=" + readWriteMount + ",dst=/home/devfence/live-rw",
+	}
+	for _, want := range wants {
+		if !strings.Contains(joined, want) {
+			t.Errorf("Docker project share mount missing %q: %s", want, joined)
+		}
 	}
 }
 
@@ -194,7 +962,8 @@ func TestTokenIsStoredOutsideManifestAndWithPrivateMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := &Session{ID: "token-session", SessionDir: sessionDir}
-	if err := prepareCredentials(session, CredentialPolicy{GitHubTokenCommand: []string{"sh", "-c", "printf '%s' 'secret-token'"}}); err != nil {
+	profile := Profile{Tools: ToolPolicy{GH: GitHubToolPolicy{Enabled: true, Authentication: GitHubAuthenticationPolicy{TokenCommand: []string{"sh", "-c", "printf '%s' 'secret-token'"}}}}}
+	if err := prepareCredentials(session, profile); err != nil {
 		t.Fatal(err)
 	}
 	tokenPath := filepath.Join(sessionDir, "credentials", "github-token")
@@ -290,18 +1059,131 @@ func TestSessionDeletionRefusesUnexportedCopyChanges(t *testing.T) {
 	}
 }
 
+func TestForwardedToolFilesDoNotBlockSessionDeletion(t *testing.T) {
+	home := t.TempDir()
+	for _, file := range []string{".codex/auth.json", ".codex/config.toml", ".claude/settings.json"} {
+		path := filepath.Join(home, file)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("session copy"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	agents := filepath.Join(home, "agents")
+	if err := os.MkdirAll(agents, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agents, "reviewer.md"), []byte("host snapshot"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(agents, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(agents, 0700) })
+	tools := ToolPolicy{
+		Codex: ForwardedToolPolicy{Enabled: true,
+			Authentication: []ForwardedFile{{Source: "~/.codex/auth.json", Target: ".codex/auth.json"}},
+			Configuration:  []ForwardedFile{{Source: "~/.codex/config.toml", Target: ".codex/config.toml"}}},
+		Claude:            ForwardedToolPolicy{Enabled: true, Configuration: []ForwardedFile{{Source: "~/.claude/settings.json", Target: ".claude/settings.json"}}},
+		SharedDirectories: []ForwardedPath{{Source: "~/agents", Target: "agents"}},
+	}
+	files, directories := managedHomeTargets(Profile{Backend: BackendBubblewrap, Tools: tools})
+	if found, err := homeHasUnmanagedFiles(home, files, directories); err != nil || found {
+		t.Fatalf("forwarded session files should be managed: found=%t err=%v", found, err)
+	}
+	history := filepath.Join(home, ".codex", "session-history.jsonl")
+	if err := os.WriteFile(history, []byte("user session data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := homeHasUnmanagedFiles(home, files, directories); err != nil || !found {
+		t.Fatalf("unforwarded tool data should block deletion: found=%t err=%v", found, err)
+	}
+}
+
+func TestManagedReadOnlyHomeSnapshotsBecomeRemovableWithoutFollowingSymlinks(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "session")
+	home := filepath.Join(sessionDir, "home")
+	readonlyDirectory := filepath.Join(home, "agents", "nested")
+	if err := os.MkdirAll(readonlyDirectory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(readonlyDirectory, "AGENTS.md"), []byte("snapshot"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(outside, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(sessionDir, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0700)
+			}
+			return nil
+		})
+		_ = os.Chmod(outside, 0700)
+	})
+	if err := os.Symlink(outside, filepath.Join(home, "agents", "outside-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readonlyDirectory, 0500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(home, "agents"), 0500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(home, 0000); err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{SessionDir: sessionDir, HomeDir: home}
+	if err := makeSessionHomeRemovable(session); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{home, filepath.Join(home, "agents"), readonlyDirectory} {
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0700 {
+			t.Errorf("managed directory %s mode = %v, err=%v", path, info, err)
+		}
+	}
+	outsideInfo, err := os.Stat(outside)
+	if err != nil || outsideInfo.Mode().Perm() != 0500 {
+		t.Fatalf("cleanup chmod followed a symlink outside session home: info=%v err=%v", outsideInfo, err)
+	}
+	if err := os.RemoveAll(sessionDir); err != nil {
+		t.Fatalf("remove session after preparing readonly data: %v", err)
+	}
+}
+
+func TestMakeSessionHomeRemovableRejectsPathOutsideSession(t *testing.T) {
+	root := t.TempDir()
+	outsideHome := filepath.Join(root, "outside-home")
+	if err := os.Mkdir(outsideHome, 0700); err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{SessionDir: filepath.Join(root, "session"), HomeDir: outsideHome}
+	if err := makeSessionHomeRemovable(session); err == nil {
+		t.Fatal("session manifest home path outside session state was accepted")
+	}
+}
+
 func TestGuestProvisioningAndRemoteArgumentEncoding(t *testing.T) {
 	root := t.TempDir()
 	key := filepath.Join(root, "vm-login")
 	if err := os.WriteFile(key+".pub", []byte("ssh-ed25519 AAAATEST devfence-test\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	data, err := guestUserData(&Session{ID: "guest-test", VMName: "devfence-guest-test", VMLoginKey: key, WorkspaceMode: "live"}, VMConfig{})
+	profile := Profile{Tools: ToolPolicy{Codex: ForwardedToolPolicy{Enabled: true}, Claude: ForwardedToolPolicy{Enabled: true}, GH: GitHubToolPolicy{Enabled: true}}}
+	data, err := guestUserData(&Session{ID: "guest-test", VMName: "devfence-guest-test", VMLoginKey: key, WorkspaceMode: "live"}, VMConfig{}, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(string(data), "#cloud-config\n") {
 		t.Fatal("cloud-init seed must be explicitly marked as cloud-config")
+	}
+	if strings.Contains(guestExecHelper, ".devfence") || strings.Contains(guestExecHelper, "NODE_PATH") {
+		t.Fatal("VM command helper still prioritizes host-copied tool installations")
 	}
 	var cloud map[string]any
 	if err := yaml.Unmarshal(data, &cloud); err != nil {
@@ -335,7 +1217,7 @@ func TestGuestProvisioningAndRemoteArgumentEncoding(t *testing.T) {
 	if !strings.Contains(string(data), "virtiofs") || !strings.Contains(string(data), "devfence-exec") {
 		t.Fatal("cloud-init does not configure the workspace mount and safe command helper")
 	}
-	bootstrap := bootstrapGuestTools("stable", "latest", "stable")
+	bootstrap := bootstrapGuestTools("stable", "latest", "stable", ToolPolicy{Codex: ForwardedToolPolicy{Enabled: true}, Claude: ForwardedToolPolicy{Enabled: true}, GH: GitHubToolPolicy{Enabled: true}})
 	if !strings.Contains(bootstrap, "n 22") || !strings.Contains(bootstrap, "@openai/codex") || !strings.Contains(bootstrap, "@anthropic-ai/claude-code") {
 		t.Fatalf("guest bootstrap is missing supported developer tools: %s", bootstrap)
 	}
@@ -355,6 +1237,66 @@ func TestGuestProvisioningAndRemoteArgumentEncoding(t *testing.T) {
 	}
 	if strings.Join(got, "\x00") != strings.Join(command, "\x00") {
 		t.Fatalf("remote command argv changed: %#v", got)
+	}
+}
+
+func TestVMProjectSharesCreateGuestMountpointsAndVirtiofsDevices(t *testing.T) {
+	root := t.TempDir()
+	key := filepath.Join(root, "vm-login")
+	if err := os.WriteFile(key+".pub", []byte("ssh-ed25519 AAAATEST devfence-test\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	readOnlySource := filepath.Join(root, "readonly")
+	readWriteSource := filepath.Join(root, "readwrite")
+	for _, path := range []string{readOnlySource, readWriteSource} {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profile := Profile{ProjectShares: []ProjectShare{
+		{Source: filepath.Join(root, "snapshot-source"), Target: "agents/snapshot", Mode: "copy"},
+		{Source: readOnlySource, Target: "agents/live-ro", Mode: "mount"},
+		{Source: readWriteSource, Target: "agents/live-rw", Mode: "mount", Access: "read-write"},
+	}}
+	session := &Session{ID: "vm-shares", VMName: "devfence-vm-shares", VMLoginKey: key, WorkspaceMode: "live"}
+	data, err := guestUserData(session, VMConfig{}, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cloud map[string]any
+	if err := yaml.Unmarshal(data, &cloud); err != nil {
+		t.Fatal(err)
+	}
+	mounts, ok := cloud["mounts"].([]any)
+	if !ok {
+		t.Fatalf("cloud-init mounts = %#v", cloud["mounts"])
+	}
+	joinedMounts, _ := json.Marshal(mounts)
+	for _, want := range []string{
+		projectShareTag(1), projectShareGuestPath(vmGuestUser(VMConfig{}), "agents/live-ro"), "ro,nosuid,nodev",
+		projectShareTag(2), projectShareGuestPath(vmGuestUser(VMConfig{}), "agents/live-rw"), "rw,nosuid,nodev",
+	} {
+		if !strings.Contains(string(joinedMounts), want) {
+			t.Errorf("cloud-init mount configuration missing %q: %s", want, joinedMounts)
+		}
+	}
+	bootcmd, _ := json.Marshal(cloud["bootcmd"])
+	if !strings.Contains(string(bootcmd), projectShareGuestPath(vmGuestUser(VMConfig{}), "agents/live-ro")) || !strings.Contains(string(bootcmd), projectShareGuestPath(vmGuestUser(VMConfig{}), "agents/live-rw")) {
+		t.Fatalf("cloud-init does not create mountpoint parents before mounting: %s", bootcmd)
+	}
+	runcmd, _ := json.Marshal(cloud["runcmd"])
+	if !strings.Contains(string(runcmd), "chown") || !strings.Contains(string(runcmd), projectShareGuestPath(vmGuestUser(VMConfig{}), "")) {
+		t.Fatalf("cloud-init does not restore guest HOME ownership after preparing mountpoints: %s", runcmd)
+	}
+	args := virtInstallArgs(session, profile, "/private/user-data", "/private/meta-data", "disk.qcow2")
+	if !containsArg(args, readOnlySource+","+projectShareTag(1)+",driver.type=virtiofs,binary.sandbox.mode=namespace,readonly=on") {
+		t.Fatalf("read-only virtiofs share device is missing: %#v", args)
+	}
+	if !containsArg(args, readWriteSource+","+projectShareTag(2)+",driver.type=virtiofs,binary.sandbox.mode=namespace") {
+		t.Fatalf("read-write virtiofs share device is missing: %#v", args)
+	}
+	if hasProjectMountShares([]ProjectShare{{Source: "/tmp/copy", Target: "copy", Mode: "copy"}}) {
+		t.Fatal("copy-only shares incorrectly require a live virtiofs device")
 	}
 }
 
@@ -469,11 +1411,15 @@ func TestCLIBootstrapAndPlanFromNonGitDirectory(t *testing.T) {
 	if code != 0 || !strings.Contains(output, "Wrote ") {
 		t.Fatalf("config init failed: code=%d output=%q", code, output)
 	}
+	code, output = captureMain(t, []string{"config", "init", "--project"})
+	if code != 0 || !strings.Contains(output, ProjectConfigPath(project)) {
+		t.Fatalf("project config init failed: code=%d output=%q", code, output)
+	}
 	code, output = captureMain(t, []string{"plan"})
 	if code != 0 {
 		t.Fatalf("plan from non-Git directory failed: %s", output)
 	}
-	if !strings.Contains(output, "Backend: bubblewrap") || !strings.Contains(output, "Workspace mode: live") || !strings.Contains(output, project) {
+	if !strings.Contains(output, "Project config: "+ProjectConfigPath(project)) || !strings.Contains(output, "Backend: bubblewrap") || !strings.Contains(output, "Workspace mode: live") || !strings.Contains(output, project) {
 		t.Fatalf("plan omitted effective workspace policy: %s", output)
 	}
 }

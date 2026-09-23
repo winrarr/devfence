@@ -1,6 +1,6 @@
 # Devfence project guide
 
-Devfence is a Linux CLI for launching project-scoped shells and development tools through Bubblewrap, rootless Docker, or libvirt/KVM. User goals and acceptance criteria are in [PLAN.md](PLAN.md); runtime boundaries are in [docs/architecture.md](docs/architecture.md) and [docs/security-model.md](docs/security-model.md).
+Devfence is a Linux CLI for launching project-scoped shells and development tools through Bubblewrap, rootless Docker, or libvirt/KVM. Runtime boundaries are in [docs/architecture.md](docs/architecture.md) and [docs/security-model.md](docs/security-model.md).
 
 ## Source of truth
 
@@ -10,6 +10,8 @@ Devfence is a Linux CLI for launching project-scoped shells and development tool
 
 ## Work safely
 
+- Devfence is early development: prioritize the forward design and make breaking config or state changes when useful. Do not add backward-compatibility shims or preserve old behavior unless explicitly requested. Remove stale code, configuration, and documentation when changes supersede them.
+- Keep the program and repository examples generic. Put user-specific host paths, accounts, and forwarding choices in the host user's Devfence config, outside the repository.
 - Treat workspace paths, credential paths, and runtime command arguments as untrusted input. Use argument arrays; never interpolate them into shell commands.
 - Never log credential values or persist them in session manifests. Pass credentials only through the selected profile and the narrowest supported mechanism.
 - Never mount a host Docker socket into a sandbox. Require a rootless Docker daemon for the container backend. Use a VM for workloads that need privileged Docker, Kind, Cilium, or eBPF.
@@ -23,4 +25,4 @@ Devfence is a Linux CLI for launching project-scoped shells and development tool
 - `go test ./...` runs focused Go tests.
 - `scripts/integration-vm.sh` provisions a disposable VM and runs an end-to-end guest check; use only when KVM/libvirt resources are available.
 
-Keep this guide short. Update product goals in `PLAN.md`, accepted trade-offs in `docs/decisions/`, concrete implementation debt in `docs/tech-debt.md`, and actionable future work in `docs/backlog.md`. Keep configuration details in `docs/configuration.md` and operational procedures beside their relevant docs. Add ADRs, debt, and backlog entries when a real decision, limitation, or deferred user need is encountered; do not add speculative filler.
+Keep this guide short. Record accepted trade-offs in `docs/decisions/`, concrete implementation debt in `docs/tech-debt.md`, and actionable future work in `docs/backlog.md`. Keep configuration details in `docs/configuration.md` and operational procedures beside their relevant docs. Add ADRs, debt, and backlog entries when a real decision, limitation, or deferred user need is encountered; do not add speculative filler.

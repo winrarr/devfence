@@ -12,8 +12,8 @@ Each entry states a current limitation, its user impact, and an acceptance condi
 ## VM provisioning uses mutable tool channels by default
 
 - Goal: make fresh VMs reproducible while retaining a low-friction first launch.
-- Rationale: default Codex/Claude packages and some Kubernetes tools install upstream `latest`/`stable`; two sessions created at different times may differ.
-- Constraints: allow users to pin supported tool versions and do not embed machine-specific paths or account data.
+- Rationale: enabled Codex/Claude packages and some Kubernetes tools install upstream `latest`/`stable`; two sessions created at different times may differ.
+- Constraints: allow users to pin supported tool versions and do not embed additional machine-specific paths or account data beyond explicitly requested defaults.
 - Acceptance: a pinned configuration provisions the same reported tool versions on two fresh guests; `plan` or `inspect` identifies the selected versions.
 
 ## VM bootstrap targets x86-64 only
@@ -22,3 +22,10 @@ Each entry states a current limitation, its user impact, and an acceptance condi
 - Rationale: the default Ubuntu image URL and guest bootstrap currently use amd64 binaries.
 - Constraints: fail with a clear error on unsupported architectures; never silently install binaries for a mismatched architecture.
 - Acceptance: architecture selection is covered by unit tests and a smoke test on each advertised architecture.
+
+## Host Node tool dependency version conflicts are not forwarded
+
+- Goal: support forwarded Codex or Claude Node installations whose dependency closure contains multiple installed versions of the same package name.
+- Rationale: Devfence forwards only each selected package and its declared dependency closure. The current flat dependency view rejects conflicting versions rather than exposing a broad host package directory.
+- Constraints: keep selected host files read-only and do not expose the host home or unrelated global package directories.
+- Acceptance: conflicting versions resolve to the version selected for each package, with tests proving unrelated host packages remain hidden.

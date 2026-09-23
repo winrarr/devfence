@@ -21,7 +21,6 @@ type runOptions struct {
 	Backend   string
 	Workspace string
 	Network   string
-	Profile   string
 	Name      string
 	VSCode    bool
 	Command   []string
@@ -81,6 +80,7 @@ func printUsage(w *os.File) {
   devfence run [RUN_OPTIONS] [-- COMMAND [ARGS...]]
   devfence plan [RUN_OPTIONS]
   devfence config init [--force]
+  devfence config init --project [--force]
   devfence list | inspect ID | attach ID [--vscode] [-- COMMAND [ARGS...]]
   devfence stop ID | delete ID --yes [--force] | export ID [--apply]
 
@@ -88,7 +88,6 @@ Run options:
   --backend bubblewrap|docker|vm   Runtime (aliases: --host, --container, --vm)
   --workspace live|copy            Workspace presentation
   --network full|none              Agent network access
-  --profile NAME                   Configuration profile
   --name ID                        Explicit session ID
   --vscode                         Open an editor attached to a persistent runtime
 
@@ -134,8 +133,6 @@ func parseRunOptions(args []string) (runOptions, error) {
 			destination = &options.Workspace
 		case "--network":
 			destination = &options.Network
-		case "--profile":
-			destination = &options.Profile
 		case "--name":
 			destination = &options.Name
 		case "-h", "--help":
@@ -174,18 +171,21 @@ func runSession(args []string, stdout *os.File) error {
 	if err != nil {
 		return err
 	}
-	resolved, err := Resolve(cfg, cwd, options.Backend, options.Workspace, options.Network, options.Profile)
+	resolved, err := Resolve(cfg, cwd, options.Backend, options.Workspace, options.Network)
 	if err != nil {
 		return err
 	}
 	if options.VSCode && resolved.Profile.Backend == BackendBubblewrap {
 		return errors.New("VS Code attachment is supported for Docker and VM sessions; use VS Code locally for Bubblewrap sessions")
 	}
+	if err := authorizeProjectShares(resolved, os.Stdin, stdout, isTerminal(os.Stdin)); err != nil {
+		return err
+	}
 	session, err := newSession(resolved, options.Name)
 	if err != nil {
 		return err
 	}
-	if err := prepareCredentials(session, resolved.Profile.Credentials); err != nil {
+	if err := prepareCredentials(session, resolved.Profile); err != nil {
 		cleanupFailedSession(session)
 		return err
 	}
@@ -263,12 +263,17 @@ func showPlan(args []string, stdout *os.File) error {
 	if err != nil {
 		return err
 	}
-	resolved, err := Resolve(cfg, cwd, options.Backend, options.Workspace, options.Network, options.Profile)
+	resolved, err := Resolve(cfg, cwd, options.Backend, options.Workspace, options.Network)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Profile: %s\nBackend: %s\nWorkspace: %s\nWorkspace mode: %s\nNetwork: %s\n",
-		resolved.ProfileName, resolved.Profile.Backend, resolved.Workspace, resolved.Profile.Workspace.Mode, resolved.Profile.Network)
+	if resolved.ProjectConfigPath != "" {
+		fmt.Fprintf(stdout, "Project config: %s\n", resolved.ProjectConfigPath)
+	} else {
+		fmt.Fprintln(stdout, "Project config: none (using global defaults)")
+	}
+	fmt.Fprintf(stdout, "Backend: %s\nWorkspace: %s\nWorkspace mode: %s\nNetwork: %s\n",
+		resolved.Profile.Backend, resolved.Workspace, resolved.Profile.Workspace.Mode, resolved.Profile.Network)
 	if resolved.Profile.Workspace.Mode == "live" {
 		fmt.Fprintln(stdout, "Presented path: live read-write mount")
 	} else {
@@ -288,10 +293,65 @@ func showPlan(args []string, stdout *os.File) error {
 	} else {
 		fmt.Fprintf(stdout, "SSH identity: %s\n", filepath.Base(resolved.Profile.Credentials.SSHKey))
 	}
-	if len(resolved.Profile.Credentials.GitHubTokenCommand) > 0 {
+	if len(resolved.Profile.Tools.GH.Authentication.TokenCommand) > 0 {
 		fmt.Fprintln(stdout, "GitHub token: provided by configured command (value hidden)")
 	} else {
 		fmt.Fprintln(stdout, "GitHub token: none")
+	}
+	for _, tool := range []struct {
+		name   string
+		policy ForwardedToolPolicy
+	}{{"Codex", resolved.Profile.Tools.Codex}, {"Claude", resolved.Profile.Tools.Claude}} {
+		state := "disabled"
+		if tool.policy.Enabled {
+			state = "enabled"
+		}
+		fmt.Fprintf(stdout, "%s CLI: %s\n", tool.name, state)
+		if len(tool.policy.Authentication) > 0 {
+			fmt.Fprintf(stdout, "%s authentication: configured forwarding (value hidden)\n", tool.name)
+		}
+		if len(tool.policy.Configuration) > 0 {
+			fmt.Fprintf(stdout, "%s configuration: configured forwarding\n", tool.name)
+		}
+	}
+	if len(resolved.Profile.Tools.SharedDirectories) > 0 {
+		fmt.Fprintf(stdout, "Shared agent directories: %d (read-only)\n", len(resolved.Profile.Tools.SharedDirectories))
+		exclusions := make(map[string]bool)
+		for _, directory := range resolved.Profile.Tools.SharedDirectories {
+			for _, excluded := range directory.Exclude {
+				exclusions[excluded] = true
+			}
+		}
+		if len(exclusions) > 0 {
+			paths := make([]string, 0, len(exclusions))
+			for excluded := range exclusions {
+				paths = append(paths, excluded)
+			}
+			sort.Strings(paths)
+			fmt.Fprintf(stdout, "Shared directory exclusions: %s\n", strings.Join(paths, ", "))
+		}
+	}
+	if len(resolved.Profile.ProjectShares) > 0 {
+		approved, err := projectSharesApproved(resolved)
+		if err != nil {
+			return err
+		}
+		state := "approval required on first launch"
+		if approved {
+			state = "approved for this exact request"
+		}
+		fmt.Fprintf(stdout, "Project host path requests (%s):\n", state)
+		for _, share := range resolved.Profile.ProjectShares {
+			if share.Mode == "copy" {
+				fmt.Fprintf(stdout, "  copy %q -> %q (private sandbox snapshot)\n", share.Source, share.Target)
+				continue
+			}
+			access := share.Access
+			if access == "" {
+				access = "read-only"
+			}
+			fmt.Fprintf(stdout, "  mount %q -> %q (%s)\n", share.Source, share.Target, access)
+		}
 	}
 	if resolved.Profile.Backend == BackendVM {
 		memory, cpus, disk := vmResourceValues(resolved.Profile)
@@ -311,25 +371,54 @@ func configCommand(args []string, stdout *os.File) error {
 	if len(args) == 0 {
 		return errors.New("usage: devfence config init|path|validate")
 	}
-	path, err := ConfigPath()
-	if err != nil {
-		return err
-	}
 	switch args[0] {
 	case "path":
+		if len(args) != 1 {
+			return errors.New("usage: devfence config path")
+		}
+		path, err := ConfigPath()
+		if err != nil {
+			return err
+		}
 		fmt.Fprintln(stdout, path)
 		return nil
 	case "init":
-		force := len(args) == 2 && args[1] == "--force"
-		if len(args) > 2 || len(args) == 2 && !force {
-			return errors.New("usage: devfence config init [--force]")
+		projectConfig := false
+		force := false
+		for _, arg := range args[1:] {
+			switch arg {
+			case "--project":
+				projectConfig = true
+			case "--force":
+				force = true
+			default:
+				return errors.New("usage: devfence config init [--project] [--force]")
+			}
+		}
+		path, err := ConfigPath()
+		if err != nil {
+			return err
+		}
+		var data []byte
+		if projectConfig {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			workspace := cwd
+			if top, err := gitTopLevel(cwd); err == nil {
+				workspace = top
+			}
+			path = ProjectConfigPath(workspace)
+			data, err = yaml.Marshal(DefaultProjectConfig())
+		} else {
+			data, err = yaml.Marshal(DefaultConfig())
+		}
+		if err != nil {
+			return err
 		}
 		if _, err := os.Stat(path); err == nil && !force {
 			return fmt.Errorf("config already exists at %s; use --force to replace it", path)
-		}
-		data, err := yaml.Marshal(DefaultConfig())
-		if err != nil {
-			return err
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 			return err
@@ -340,6 +429,10 @@ func configCommand(args []string, stdout *os.File) error {
 		fmt.Fprintf(stdout, "Wrote %s\n", path)
 		return nil
 	case "validate":
+		path, err := ConfigPath()
+		if err != nil {
+			return err
+		}
 		cfg, err := LoadConfig(path)
 		if err != nil {
 			return err
@@ -347,7 +440,18 @@ func configCommand(args []string, stdout *os.File) error {
 		if err := cfg.Validate(); err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "Configuration is valid (%d profiles)\n", len(cfg.Profiles))
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		workspace := cwd
+		if top, err := gitTopLevel(cwd); err == nil {
+			workspace = top
+		}
+		if _, _, err := LoadProjectConfig(workspace); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "Configuration is valid")
 		return nil
 	default:
 		return fmt.Errorf("unknown config command %q", args[0])
@@ -375,6 +479,18 @@ func printSessionSummary(stdout *os.File, session *Session, profile Profile) {
 		fmt.Fprintln(stdout, "  GitHub token: enabled (value hidden)")
 	} else {
 		fmt.Fprintln(stdout, "  GitHub token: none")
+	}
+	if session.CodexEnabled {
+		fmt.Fprintln(stdout, "  Codex CLI: enabled")
+	}
+	if session.CodexAuthEnabled {
+		fmt.Fprintln(stdout, "  Codex authentication: configured forwarding (value hidden)")
+	}
+	if session.ClaudeEnabled {
+		fmt.Fprintln(stdout, "  Claude CLI: enabled")
+	}
+	if session.ClaudeAuthEnabled {
+		fmt.Fprintln(stdout, "  Claude authentication: configured forwarding (value hidden)")
 	}
 	if session.Backend == BackendVM {
 		memory, cpus, disk := vmResourceValues(profile)
@@ -445,6 +561,12 @@ func inspectCommand(args []string, stdout *os.File) error {
 		fmt.Fprintln(stdout, "SSH identity: none")
 	}
 	fmt.Fprintf(stdout, "GitHub token: %t (value hidden)\n", session.GitHubEnabled)
+	if session.Backend == BackendBubblewrap {
+		fmt.Fprintf(stdout, "Codex CLI enabled: %t\n", session.CodexEnabled)
+		fmt.Fprintf(stdout, "Codex authentication: %t (value hidden)\n", session.CodexAuthEnabled)
+		fmt.Fprintf(stdout, "Claude CLI enabled: %t\n", session.ClaudeEnabled)
+		fmt.Fprintf(stdout, "Claude authentication: %t (value hidden)\n", session.ClaudeAuthEnabled)
+	}
 	if session.VMAddress != "" {
 		fmt.Fprintf(stdout, "VM address: %s\n", session.VMAddress)
 	}
@@ -502,8 +624,11 @@ func attachCommand(args []string, stdout *os.File) error {
 	if err != nil {
 		return err
 	}
+	if err := authorizeProjectShares(resolved, os.Stdin, stdout, isTerminal(os.Stdin)); err != nil {
+		return err
+	}
 	wasGitHubEnabled := session.GitHubEnabled
-	if err := prepareCredentials(session, resolved.Profile.Credentials); err != nil {
+	if err := prepareCredentials(session, resolved.Profile); err != nil {
 		return err
 	}
 	if options.VSCode {
@@ -533,12 +658,12 @@ func attachCommand(args []string, stdout *os.File) error {
 }
 
 func resolveExistingSession(cfg Config, session *Session) (Resolved, error) {
-	resolved, err := Resolve(cfg, session.WorkingDir, "", "", "", session.ProfileName)
+	resolved, err := Resolve(cfg, session.WorkingDir, "", "", "")
 	if err != nil {
 		return Resolved{}, err
 	}
-	if resolved.Workspace != session.SourceWorkspace || resolved.Profile.Backend != session.Backend || resolved.Profile.Workspace.Mode != session.WorkspaceMode || resolved.Profile.Network != session.Network || credentialPolicyHash(resolved.Profile.Credentials) != session.CredentialPolicy {
-		return Resolved{}, errors.New("the selected profile's workspace or runtime policy changed; create a new session instead of attaching")
+	if resolved.Workspace != session.SourceWorkspace || resolved.Profile.Backend != session.Backend || resolved.Profile.Workspace.Mode != session.WorkspaceMode || resolved.Profile.Network != session.Network || forwardingPolicyHash(resolved.Profile) != session.ForwardingPolicy {
+		return Resolved{}, errors.New("the effective workspace or runtime policy changed; create a new session instead of attaching")
 	}
 	return resolved, nil
 }
@@ -577,7 +702,7 @@ func prepareAndOpenDocker(session *Session, resolved Resolved, create bool) erro
 		return err
 	}
 	if create {
-		if err := ensureDockerImage(session.SessionDir); err != nil {
+		if err := ensureDockerImage(session.SessionDir, resolved.Profile.Tools); err != nil {
 			return err
 		}
 		if err := createContainer(session, resolved); err != nil {
@@ -716,7 +841,38 @@ func deleteCommand(args []string) error {
 		}
 	}
 	stopSSHAgent(session)
+	if err := makeSessionHomeRemovable(session); err != nil {
+		return err
+	}
 	return os.RemoveAll(session.SessionDir)
+}
+
+func makeSessionHomeRemovable(session *Session) error {
+	expected := filepath.Join(session.SessionDir, "home")
+	if filepath.Clean(session.HomeDir) != filepath.Clean(expected) {
+		return errors.New("session home directory is outside its session state directory")
+	}
+	info, err := os.Lstat(session.HomeDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("session home directory is not a real directory")
+	}
+	return filepath.WalkDir(session.HomeDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if err := os.Chmod(path, 0700); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func checkSessionHasNoUnpreservedWork(session *Session) error {
@@ -753,7 +909,7 @@ func checkSessionHasNoUnpreservedWork(session *Session) error {
 			return errors.New("could not verify live Git worktree; use --force only after reviewing the work")
 		}
 	}
-	hasHomeFiles, err := homeHasFiles(session.HomeDir)
+	hasHomeFiles, err := homeHasUnmanagedFiles(session.HomeDir, session.ManagedHomeFiles, session.ManagedHomeDirs)
 	if err != nil {
 		return fmt.Errorf("inspect session home directory: %w", err)
 	}
@@ -763,12 +919,49 @@ func checkSessionHasNoUnpreservedWork(session *Session) error {
 	return nil
 }
 
-func homeHasFiles(path string) (bool, error) {
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return false, err
+func homeHasUnmanagedFiles(home string, managedFiles, managedDirectories []string) (bool, error) {
+	managedFilesSet := make(map[string]bool, len(managedFiles))
+	managedFileParents := make(map[string]bool, len(managedFiles))
+	managedDirectoriesSet := make(map[string]bool, len(managedDirectories))
+	for _, target := range managedFiles {
+		target = filepath.ToSlash(filepath.Clean(filepath.FromSlash(target)))
+		managedFilesSet[target] = true
+		for parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(target))); parent != "."; parent = filepath.ToSlash(filepath.Dir(filepath.FromSlash(parent))) {
+			managedFileParents[parent] = true
+		}
 	}
-	return len(entries) > 0, nil
+	for _, target := range managedDirectories {
+		managedDirectoriesSet[filepath.ToSlash(filepath.Clean(filepath.FromSlash(target)))] = true
+	}
+	hasUnmanagedFiles := false
+	err := filepath.WalkDir(home, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(home, current)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		relative = filepath.ToSlash(relative)
+		if managedDirectoriesSet[relative] && entry.IsDir() && entry.Type()&os.ModeSymlink == 0 {
+			return filepath.SkipDir
+		}
+		if managedFilesSet[relative] {
+			return nil
+		}
+		if entry.IsDir() && managedFileParents[relative] {
+			return nil
+		}
+		hasUnmanagedFiles = true
+		if entry.IsDir() {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return hasUnmanagedFiles, err
 }
 
 func gitDirty(path string) (bool, error) {
@@ -856,5 +1049,6 @@ func cleanupFailedSession(session *Session) {
 	if session.Backend == BackendVM {
 		_ = deleteVM(session, true)
 	}
+	_ = makeSessionHomeRemovable(session)
 	_ = os.RemoveAll(session.SessionDir)
 }

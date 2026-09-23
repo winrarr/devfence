@@ -15,8 +15,32 @@ virsh --connect qemu:///system net-info default >/dev/null
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/devfence-vm-test.XXXXXX")"
 session_id="vm-smoke-$(date +%s)-$$"
 mkdir -p "$test_root/home" "$test_root/config/devfence" "$test_root/state" "$test_root/cache" "$test_root/project"
-cp "$project_root/scripts/fixtures/vm-integration.yaml" "$test_root/config/devfence/config.yaml"
+mkdir -p "$test_root/agent-guidance/.env" "$test_root/shared-config" "$test_root/readonly-config"
+sed "s|GLOBAL_INSTRUCTIONS_PATH|$test_root/global-instructions.md|" \
+	"$project_root/scripts/fixtures/vm-integration.yaml" > "$test_root/config/devfence/config.yaml"
+cat > "$test_root/global-instructions.md" <<'EOF'
+When asked to report the global instruction marker, include DEVFENCE_VM_CODEX_INSTRUCTIONS_48a62d.
+EOF
+printf 'shared agent guidance\n' > "$test_root/agent-guidance/AGENTS.md"
+printf 'host-only value\n' > "$test_root/agent-guidance/.env/secret"
+printf 'initial host value\n' > "$test_root/shared-config/value.txt"
+printf 'read-only host value\n' > "$test_root/readonly-config/value.txt"
 printf 'host-only sentinel\n' > "$test_root/host-secret"
+cat > "$test_root/project/.devfence.yaml" <<'EOF'
+version: 3
+shares:
+  - source: ../agent-guidance
+    target: agents
+    mode: copy
+    exclude: [.env]
+  - source: ../shared-config
+    target: shared-config
+    mode: mount
+    access: read-write
+  - source: ../readonly-config
+    target: readonly-config
+    mode: mount
+EOF
 
 devfence() {
 	env HOME="$test_root/home" \
@@ -40,12 +64,32 @@ trap cleanup EXIT
 cd "$test_root/project"
 devfence config validate
 devfence plan
-devfence run --name "$session_id" -- /usr/bin/true
+cat > "$test_root/start-session" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export HOME="$test_root/home"
+export XDG_CONFIG_HOME="$test_root/config"
+export XDG_STATE_HOME="$test_root/state"
+export XDG_CACHE_HOME="$test_root/cache"
+exec "$binary" run --name "$session_id" -- /usr/bin/true
+EOF
+chmod 0700 "$test_root/start-session"
+printf 'yes\n' | script -qefc "$test_root/start-session" /dev/null
 devfence list
 
 guest_secret_path="$(printf '%q' "$test_root/host-secret")"
 guest_command="set -euxo pipefail
 test ! -e $guest_secret_path
+test \"\$(cat \"\$HOME/agents/AGENTS.md\")\" = 'shared agent guidance'
+test ! -e \"\$HOME/agents/.env\"
+test -r \"\$HOME/.codex/AGENTS.md\"
+set +x
+prompt_input=\$(codex debug prompt-input 'Report the global instruction marker.')
+[[ "\$prompt_input" == *DEVFENCE_VM_CODEX_INSTRUCTIONS_48a62d* ]]
+set -x
+unset prompt_input
+printf 'changed by VM\\n' > \"\$HOME/shared-config/from-vm\"
+if touch \"\$HOME/readonly-config/forbidden\"; then exit 1; fi
 test -S /var/run/docker.sock
 test -w /workspace
 touch /workspace/.devfence-vm-smoke
@@ -61,6 +105,8 @@ cilium status --wait --wait-duration 5m
 kubectl get nodes -o wide
 kind delete cluster --name devfence-smoke"
 devfence attach "$session_id" -- /bin/bash -lc "$guest_command"
+test "$(cat "$test_root/shared-config/from-vm")" = 'changed by VM'
+test ! -e "$test_root/readonly-config/forbidden"
 devfence stop "$session_id"
 devfence inspect "$session_id"
 devfence attach "$session_id" -- /usr/bin/true

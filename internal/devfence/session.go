@@ -34,9 +34,15 @@ type Session struct {
 	SSHAgentPID        int       `json:"sshAgentPid,omitempty"`
 	SSHKeyName         string    `json:"sshKeyName,omitempty"`
 	SSHKeyFingerprint  string    `json:"sshKeyFingerprint,omitempty"`
-	CredentialPolicy   string    `json:"credentialPolicyHash"`
+	ForwardingPolicy   string    `json:"forwardingPolicyHash"`
 	GitHubEnabled      bool      `json:"githubEnabled"`
 	GitHubTokenHash    string    `json:"githubTokenHash,omitempty"`
+	CodexEnabled       bool      `json:"codexEnabled"`
+	ClaudeEnabled      bool      `json:"claudeEnabled"`
+	CodexAuthEnabled   bool      `json:"codexAuthEnabled"`
+	ClaudeAuthEnabled  bool      `json:"claudeAuthEnabled"`
+	ManagedHomeFiles   []string  `json:"managedHomeFiles,omitempty"`
+	ManagedHomeDirs    []string  `json:"managedHomeDirectories,omitempty"`
 	VMLoginKey         string    `json:"vmLoginKey,omitempty"`
 	VMAddress          string    `json:"vmAddress,omitempty"`
 	HomeDir            string    `json:"homeDirectory,omitempty"`
@@ -53,10 +59,41 @@ func vmNameForSession(id string) string {
 	return "devfence-" + suffix[:46] + "-" + hex.EncodeToString(hash[:4])
 }
 
-func credentialPolicyHash(policy CredentialPolicy) string {
-	data, _ := json.Marshal(policy)
+func forwardingPolicyHash(profile Profile) string {
+	data, _ := json.Marshal(struct {
+		Credentials CredentialPolicy `json:"credentials"`
+		Tools       ToolPolicy       `json:"tools"`
+		Shares      []ProjectShare   `json:"shares,omitempty"`
+	}{Credentials: profile.Credentials, Tools: profile.Tools, Shares: profile.ProjectShares})
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
+}
+
+func managedHomeTargets(profile Profile) (files, directories []string) {
+	tools := profile.Tools
+	for _, tool := range []ForwardedToolPolicy{tools.Codex, tools.Claude} {
+		if !tool.Enabled {
+			continue
+		}
+		for _, file := range append(append([]ForwardedFile(nil), tool.Authentication...), tool.Configuration...) {
+			files = append(files, filepath.ToSlash(filepath.Clean(filepath.FromSlash(file.Target))))
+		}
+	}
+	for _, directory := range tools.SharedDirectories {
+		directories = append(directories, filepath.ToSlash(filepath.Clean(filepath.FromSlash(directory.Target))))
+	}
+	for _, share := range profile.ProjectShares {
+		if share.Mode == "mount" {
+			directories = append(directories, filepath.ToSlash(filepath.Clean(filepath.FromSlash(share.Target))))
+			continue
+		}
+		if info, err := os.Stat(share.Source); err == nil && info.IsDir() {
+			directories = append(directories, filepath.ToSlash(filepath.Clean(filepath.FromSlash(share.Target))))
+		} else {
+			files = append(files, filepath.ToSlash(filepath.Clean(filepath.FromSlash(share.Target))))
+		}
+	}
+	return files, directories
 }
 
 var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$`)
@@ -119,12 +156,17 @@ func newSession(resolved Resolved, idOverride string) (*Session, error) {
 		Status:             "starting",
 		SessionDir:         sessionDir,
 		HomeDir:            filepath.Join(sessionDir, "home"),
-		GitHubEnabled:      len(resolved.Profile.Credentials.GitHubTokenCommand) > 0,
+		GitHubEnabled:      len(resolved.Profile.Tools.GH.Authentication.TokenCommand) > 0,
+		CodexEnabled:       resolved.Profile.Tools.Codex.Enabled,
+		ClaudeEnabled:      resolved.Profile.Tools.Claude.Enabled,
+		CodexAuthEnabled:   resolved.Profile.Tools.Codex.Enabled && len(resolved.Profile.Tools.Codex.Authentication) > 0,
+		ClaudeAuthEnabled:  resolved.Profile.Tools.Claude.Enabled && len(resolved.Profile.Tools.Claude.Authentication) > 0,
 		ContainerName:      "devfence-" + id,
 		VMName:             vmName,
 		SSHAgentDir:        sshAgentDir,
-		CredentialPolicy:   credentialPolicyHash(resolved.Profile.Credentials),
+		ForwardingPolicy:   forwardingPolicyHash(resolved.Profile),
 	}
+	session.ManagedHomeFiles, session.ManagedHomeDirs = managedHomeTargets(resolved.Profile)
 	if copyState != nil {
 		session.CopyStatePath = filepath.Join(sessionDir, "copy-state.json")
 		if err := writeCopyState(session.CopyStatePath, copyState); err != nil {

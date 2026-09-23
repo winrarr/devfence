@@ -23,7 +23,7 @@ func runDocker(session *Session, resolved Resolved, command []string, create boo
 		return err
 	}
 	if create {
-		if err := ensureDockerImage(session.SessionDir); err != nil {
+		if err := ensureDockerImage(session.SessionDir, resolved.Profile.Tools); err != nil {
 			return err
 		}
 		if err := createContainer(session, resolved); err != nil {
@@ -63,8 +63,8 @@ func requireRootlessDocker() error {
 	return nil
 }
 
-func ensureDockerImage(sessionDir string) error {
-	image, err := dockerImageReference()
+func ensureDockerImage(sessionDir string, tools ToolPolicy) error {
+	image, err := dockerImageReference(tools)
 	if err != nil {
 		return err
 	}
@@ -89,7 +89,13 @@ func ensureDockerImage(sessionDir string) error {
 			return err
 		}
 	}
-	cmd := execCommand("docker", "build", "--tag", image, contextDir)
+	args := []string{"build", "--tag", image,
+		"--build-arg", "DEVFENCE_CODEX=" + strconv.FormatBool(tools.Codex.Enabled),
+		"--build-arg", "DEVFENCE_CLAUDE=" + strconv.FormatBool(tools.Claude.Enabled),
+		"--build-arg", "DEVFENCE_GH=" + strconv.FormatBool(tools.GH.Enabled),
+		contextDir,
+	}
+	cmd := execCommand("docker", args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("build Devfence container image: %w", err)
@@ -97,7 +103,7 @@ func ensureDockerImage(sessionDir string) error {
 	return nil
 }
 
-func dockerImageReference() (string, error) {
+func dockerImageReference(tools ToolPolicy) (string, error) {
 	hash := sha256.New()
 	for _, path := range []string{"runtime/Dockerfile", "runtime/devfence-exec"} {
 		data, err := fs.ReadFile(dockerAssets, path)
@@ -107,6 +113,7 @@ func dockerImageReference() (string, error) {
 		_, _ = hash.Write([]byte(path + "\x00"))
 		_, _ = hash.Write(data)
 	}
+	_, _ = fmt.Fprintf(hash, "\x00codex=%t\x00claude=%t\x00gh=%t", tools.Codex.Enabled, tools.Claude.Enabled, tools.GH.Enabled)
 	return "devfence:ubuntu-24.04-" + hex.EncodeToString(hash.Sum(nil)[:6]), nil
 }
 
@@ -116,7 +123,6 @@ func createContainer(session *Session, resolved Resolved) error {
 			return errors.New("container bind mount paths cannot contain commas")
 		}
 	}
-	uid, gid := os.Getuid(), os.Getgid()
 	network := "bridge"
 	if session.Network == "none" {
 		network = "none"
@@ -125,7 +131,6 @@ func createContainer(session *Session, resolved Resolved) error {
 		"run", "--detach", "--name", session.ContainerName,
 		"--label", "devfence.managed=true",
 		"--label", "devfence.session=" + session.ID,
-		"--user", strconv.Itoa(uid) + ":" + strconv.Itoa(gid),
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges:true",
 		"--read-only",
@@ -157,7 +162,36 @@ func createContainer(session *Session, resolved Resolved) error {
 	if value := os.Getenv("TERM"); value != "" {
 		args = append(args, "--env", "TERM="+value)
 	}
-	image, err := dockerImageReference()
+	forwardedDirectories, err := forwardedDirectoryTargets(resolved.Profile.Tools, session.HomeDir)
+	if err != nil {
+		return err
+	}
+	for _, path := range forwardedDirectories {
+		if strings.Contains(path, ",") {
+			return errors.New("container bind mount paths cannot contain commas")
+		}
+		relative, _ := filepath.Rel(session.HomeDir, path)
+		args = append(args, "--mount", "type=bind,src="+path+",dst="+filepath.Join("/home/devfence", relative)+",readonly")
+	}
+	for _, share := range resolved.Profile.ProjectShares {
+		source := share.Source
+		if share.Mode == "copy" {
+			source, err = safeForwardTarget(session.HomeDir, share.Target)
+			if err != nil {
+				return err
+			}
+		}
+		destination := filepath.Join("/home/devfence", filepath.FromSlash(share.Target))
+		if strings.Contains(source, ",") || strings.Contains(destination, ",") {
+			return errors.New("container bind mount paths cannot contain commas")
+		}
+		mount := "type=bind,src=" + source + ",dst=" + destination
+		if share.Mode == "copy" || share.Access != "read-write" {
+			mount += ",readonly"
+		}
+		args = append(args, "--mount", mount)
+	}
+	image, err := dockerImageReference(resolved.Profile.Tools)
 	if err != nil {
 		return err
 	}

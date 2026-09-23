@@ -1,6 +1,7 @@
 package devfence
 
 import (
+	"archive/tar"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -64,6 +65,9 @@ func prepareVM(session *Session, resolved Resolved, create, revokeGitHub bool) (
 	if err := writeSSHConfig(resolved.StateDir, session, userName); err != nil {
 		return "", err
 	}
+	if err := syncForwardedToolsToVM(session, resolved.Profile, userName, address); err != nil {
+		return "", err
+	}
 	if session.GitHubEnabled {
 		if err := loginGitHubInVM(session, userName, address); err != nil {
 			return "", err
@@ -81,7 +85,7 @@ func prepareVM(session *Session, resolved Resolved, create, revokeGitHub bool) (
 	return address, nil
 }
 
-func validateVMTools(liveWorkspace bool) error {
+func validateVMTools(needsVirtioFS bool) error {
 	if runtime.GOARCH != "amd64" {
 		return fmt.Errorf("VM backend currently supports x86-64 hosts, not %s", runtime.GOARCH)
 	}
@@ -90,7 +94,7 @@ func validateVMTools(liveWorkspace bool) error {
 			return fmt.Errorf("VM backend requires %s", name)
 		}
 	}
-	if liveWorkspace {
+	if needsVirtioFS {
 		found := false
 		for _, path := range []string{"/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd"} {
 			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 {
@@ -99,7 +103,7 @@ func validateVMTools(liveWorkspace bool) error {
 			}
 		}
 		if !found {
-			return errors.New("VM live workspaces require virtiofsd")
+			return errors.New("VM workspaces and live project shares require virtiofsd")
 		}
 	}
 	if err := execCommand("virsh", "--connect", "qemu:///system", "list", "--all").Run(); err != nil {
@@ -112,7 +116,12 @@ func createVM(session *Session, resolved Resolved) error {
 	if strings.Contains(session.PresentedWorkspace, ",") {
 		return errors.New("VM virtiofs workspace paths cannot contain commas")
 	}
-	if err := validateVMTools(session.WorkspaceMode == "live"); err != nil {
+	for _, share := range resolved.Profile.ProjectShares {
+		if share.Mode == "mount" && strings.Contains(share.Source, ",") {
+			return errors.New("VM virtiofs share paths cannot contain commas")
+		}
+	}
+	if err := validateVMTools(session.WorkspaceMode == "live" || session.WorkspaceMode == "copy" || hasProjectMountShares(resolved.Profile.ProjectShares)); err != nil {
 		return err
 	}
 	if err := ensureVMLoginKey(session); err != nil {
@@ -122,7 +131,7 @@ func createVM(session *Session, resolved Resolved) error {
 	if err != nil {
 		return err
 	}
-	userData, err := guestUserData(session, resolved.Profile.VM)
+	userData, err := guestUserData(session, resolved.Profile.VM, resolved.Profile)
 	if err != nil {
 		return err
 	}
@@ -422,7 +431,8 @@ func createVMDisk(name, backingPath string, profile Profile) error {
 	return nil
 }
 
-func guestUserData(session *Session, settings VMConfig) ([]byte, error) {
+func guestUserData(session *Session, settings VMConfig, profile Profile) ([]byte, error) {
+	tools := profile.Tools
 	userName := vmGuestUser(settings)
 	if !regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`).MatchString(userName) {
 		return nil, fmt.Errorf("invalid VM guest user name %q", userName)
@@ -453,8 +463,22 @@ func guestUserData(session *Session, settings VMConfig) ([]byte, error) {
 		}
 	}
 	var mounts [][]string
+	var bootcmd [][]string
 	if session.WorkspaceMode == "live" || session.WorkspaceMode == "copy" {
 		mounts = [][]string{{workspaceShareTag, "/workspace", "virtiofs", "rw,nosuid,nodev", "0", "0"}}
+		bootcmd = append(bootcmd, []string{"mkdir", "-p", "/workspace"})
+	}
+	for index, share := range profile.ProjectShares {
+		if share.Mode != "mount" {
+			continue
+		}
+		guestPath := projectShareGuestPath(userName, share.Target)
+		if share.Access == "read-write" {
+			mounts = append(mounts, []string{projectShareTag(index), guestPath, "virtiofs", "rw,nosuid,nodev", "0", "0"})
+		} else {
+			mounts = append(mounts, []string{projectShareTag(index), guestPath, "virtiofs", "ro,nosuid,nodev", "0", "0"})
+		}
+		bootcmd = append(bootcmd, []string{"mkdir", "-p", guestPath})
 	}
 	userdata := map[string]any{
 		"hostname":            session.VMName,
@@ -462,18 +486,20 @@ func guestUserData(session *Session, settings VMConfig) ([]byte, error) {
 		"ssh_pwauth":          false,
 		"disable_root":        true,
 		"ssh_authorized_keys": []string{strings.TrimSpace(string(pubKey))},
-		"packages":            []string{"ca-certificates", "curl", "docker.io", "gh", "git", "openssh-server", "jq", "make", "build-essential", "nodejs", "npm", "python3", "iptables", "iproute2", "conntrack"},
+		"packages":            []string{"ca-certificates", "curl", "docker.io", "git", "openssh-server", "jq", "make", "build-essential", "nodejs", "npm", "python3", "iptables", "iproute2", "conntrack"},
 		"mounts":              mounts,
+		"bootcmd":             bootcmd,
 		"write_files": []map[string]any{
 			{"path": "/etc/modules-load.d/devfence.conf", "permissions": "0644", "content": "overlay\nbr_netfilter\nvxlan\nip_tables\nip6_tables\n"},
 			{"path": "/etc/sysctl.d/99-devfence.conf", "permissions": "0644", "content": "net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\nnet.bridge-nf-call-ip6tables=1\n"},
 			{"path": "/usr/local/bin/devfence-exec", "permissions": "0755", "content": guestExecHelper},
 		},
 		"runcmd": [][]string{
+			{"chown", userName + ":" + userName, filepath.Join("/home", userName)},
 			{"usermod", "-aG", "docker", userName},
 			{"systemctl", "enable", "--now", "docker"},
 			{"sysctl", "--system"},
-			{"bash", "-lc", bootstrapGuestTools(kubectlVersion, kindVersion, ciliumVersion)},
+			{"bash", "-lc", bootstrapGuestTools(kubectlVersion, kindVersion, ciliumVersion, tools)},
 			{"touch", "/var/lib/devfence-ready"},
 		},
 	}
@@ -516,7 +542,7 @@ func guestMetaData(session *Session) ([]byte, error) {
 	})
 }
 
-func bootstrapGuestTools(kubectlVersion, kindVersion, ciliumVersion string) string {
+func bootstrapGuestTools(kubectlVersion, kindVersion, ciliumVersion string, tools ToolPolicy) string {
 	kubectlSetup := "KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
 	if kubectlVersion != "stable" {
 		kubectlSetup = "KUBECTL_VERSION=" + strconv.Quote(versionTag(kubectlVersion))
@@ -528,6 +554,16 @@ func bootstrapGuestTools(kubectlVersion, kindVersion, ciliumVersion string) stri
 	ciliumSetup := "CILIUM_VERSION=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)"
 	if ciliumVersion != "stable" {
 		ciliumSetup = "CILIUM_VERSION=" + strconv.Quote(versionTag(ciliumVersion))
+	}
+	var installTools []string
+	if tools.GH.Enabled {
+		installTools = append(installTools, "apt-get update && apt-get install -y --no-install-recommends gh")
+	}
+	if tools.Codex.Enabled {
+		installTools = append(installTools, "npm install --global @openai/codex")
+	}
+	if tools.Claude.Enabled {
+		installTools = append(installTools, "npm install --global @anthropic-ai/claude-code")
 	}
 	return fmt.Sprintf(`set -eu
 %s
@@ -543,8 +579,9 @@ rm -f /tmp/cilium.tar.gz
 npm install --global n
 n 22
 hash -r
-npm install --global @openai/codex @anthropic-ai/claude-code`,
-		kubectlSetup, kindURL, ciliumSetup)
+
+%s`,
+		kubectlSetup, kindURL, ciliumSetup, strings.Join(installTools, "\n"))
 }
 
 func versionTag(version string) string {
@@ -593,7 +630,34 @@ func virtInstallArgs(session *Session, profile Profile, cloudConfig, metaData, d
 		args = append(args, "--memorybacking", "source.type=memfd,access.mode=shared")
 		args = append(args, "--filesystem", session.PresentedWorkspace+","+workspaceShareTag+",driver.type=virtiofs,binary.sandbox.mode=namespace")
 	}
+	for index, share := range profile.ProjectShares {
+		if share.Mode != "mount" {
+			continue
+		}
+		filesystem := share.Source + "," + projectShareTag(index) + ",driver.type=virtiofs,binary.sandbox.mode=namespace"
+		if share.Access != "read-write" {
+			filesystem += ",readonly=on"
+		}
+		args = append(args, "--filesystem", filesystem)
+	}
 	return args
+}
+
+func hasProjectMountShares(shares []ProjectShare) bool {
+	for _, share := range shares {
+		if share.Mode == "mount" {
+			return true
+		}
+	}
+	return false
+}
+
+func projectShareTag(index int) string {
+	return "devfence-share-" + strconv.Itoa(index)
+}
+
+func projectShareGuestPath(userName, target string) string {
+	return filepath.Join("/home", userName, filepath.FromSlash(target))
 }
 
 func startVM(session *Session) error {
@@ -728,6 +792,178 @@ func execInVM(session *Session, userName, address string, command []string) erro
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("VM command: %w", err)
+	}
+	return nil
+}
+
+const vmForwardedFilesReceiver = `import io, json, os, shutil, stat, sys, tarfile
+
+home = os.path.realpath(os.path.expanduser("~"))
+readonly = json.loads(sys.argv[1])
+
+def safe_parts(value):
+    if not isinstance(value, str) or value.startswith("/"):
+        raise ValueError("invalid forwarded path")
+    parts = value.split("/")
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValueError("invalid forwarded path")
+    return parts
+
+def directory(parts):
+    current = home
+    for part in parts:
+        current = os.path.join(current, part)
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            pass
+        if os.path.islink(current) or not os.path.isdir(current):
+            raise ValueError("forwarded target parent is not a real directory")
+    return current
+
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as archive:
+    for item in archive:
+        parts = safe_parts(item.name.rstrip("/"))
+        if item.isdir():
+            directory(parts)
+            continue
+        if not item.isfile():
+            raise ValueError("forwarded archive contains a non-file entry")
+        parent = directory(parts[:-1])
+        target = os.path.join(parent, parts[-1])
+        mode = stat.S_IMODE(item.mode) & 0o777
+        source = archive.extractfile(item)
+        if source is None:
+            raise ValueError("forwarded archive file has no contents")
+        try:
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        except FileExistsError:
+            while source.read(1024 * 1024):
+                pass
+            continue
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                shutil.copyfileobj(source, output)
+            os.chmod(target, mode)
+        except Exception:
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+            raise
+
+for value in readonly:
+    parts = safe_parts(value)
+    parent = directory(parts[:-1])
+    root = os.path.join(parent, parts[-1])
+    if os.path.islink(root):
+        raise ValueError("read-only forwarded target is a symlink")
+    if os.path.isfile(root):
+        mode = stat.S_IMODE(os.stat(root, follow_symlinks=False).st_mode) & ~0o222
+        os.chmod(root, mode, follow_symlinks=False)
+        continue
+    if not os.path.isdir(root):
+        raise ValueError("read-only forwarded target is missing or unsupported")
+    for current, dirs, files in os.walk(root, topdown=False, followlinks=False):
+        for name in dirs + files:
+            child = os.path.join(current, name)
+            if os.path.islink(child):
+                raise ValueError("shared directory contains a symlink")
+            mode = stat.S_IMODE(os.stat(child, follow_symlinks=False).st_mode) & ~0o222
+            os.chmod(child, mode, follow_symlinks=False)
+        mode = stat.S_IMODE(os.stat(current, follow_symlinks=False).st_mode) & ~0o222
+        os.chmod(current, mode, follow_symlinks=False)
+`
+
+func syncForwardedToolsToVM(session *Session, profile Profile, userName, address string) error {
+	entries, err := forwardedSyncEntries(session.HomeDir, profile)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	var readOnlyTargets []string
+	for _, policy := range profile.Tools.SharedDirectories {
+		path, err := safeForwardTarget(session.HomeDir, policy.Target)
+		if err != nil {
+			return err
+		}
+		if info, err := os.Lstat(path); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			readOnlyTargets = append(readOnlyTargets, policy.Target)
+		}
+	}
+	for _, share := range profile.ProjectShares {
+		if share.Mode == "copy" {
+			readOnlyTargets = append(readOnlyTargets, share.Target)
+		}
+	}
+	readonlyJSON, _ := json.Marshal(readOnlyTargets)
+	cmd := sshCommand(session, userName, address, false, "python3", "-c", vmForwardedFilesReceiver, string(readonlyJSON))
+	var remoteError bytes.Buffer
+	cmd.Stdout, cmd.Stderr = io.Discard, &remoteError
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("prepare forwarded tool files for VM: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start VM tool forwarding: %w", err)
+	}
+	archive := tar.NewWriter(stdin)
+	var archiveErr error
+	for _, entry := range entries {
+		info, err := os.Lstat(entry.source)
+		if err != nil {
+			archiveErr = err
+			break
+		}
+		mode := info.Mode().Perm()
+		if entry.readOnly {
+			mode &^= 0222
+		}
+		header := &tar.Header{Name: entry.target, Mode: int64(mode), ModTime: info.ModTime(), Format: tar.FormatPAX}
+		if entry.directory {
+			header.Typeflag = tar.TypeDir
+			header.Name = strings.TrimSuffix(entry.target, "/") + "/"
+			if err := archive.WriteHeader(header); err != nil {
+				archiveErr = err
+				break
+			}
+			continue
+		}
+		header.Typeflag = tar.TypeReg
+		header.Size = info.Size()
+		if err := archive.WriteHeader(header); err != nil {
+			archiveErr = err
+			break
+		}
+		file, err := openRegularNoFollow(entry.source)
+		if err != nil {
+			archiveErr = err
+			break
+		}
+		_, copyErr := io.CopyN(archive, file, info.Size())
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil {
+			archiveErr = errors.Join(copyErr, closeErr)
+			break
+		}
+	}
+	if closeErr := archive.Close(); archiveErr == nil {
+		archiveErr = closeErr
+	}
+	if closeErr := stdin.Close(); archiveErr == nil {
+		archiveErr = closeErr
+	}
+	waitErr := cmd.Wait()
+	if archiveErr != nil {
+		return fmt.Errorf("stream forwarded files to VM: %w", archiveErr)
+	}
+	if waitErr != nil {
+		if message := strings.TrimSpace(remoteError.String()); message != "" {
+			return fmt.Errorf("could not install forwarded files inside VM: %s", message)
+		}
+		return fmt.Errorf("could not install forwarded tool files inside VM: %w", waitErr)
 	}
 	return nil
 }

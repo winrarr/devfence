@@ -20,25 +20,76 @@ const (
 
 type Config struct {
 	Version        int                `yaml:"version"`
-	DefaultProfile string             `yaml:"defaultProfile"`
-	Profiles       map[string]Profile `yaml:"profiles"`
-	Rules          []Rule             `yaml:"rules"`
+	Defaults       Profile            `yaml:"defaults"`
+	GitHub         GitHubAccessPolicy `yaml:"github"`
 	ProtectedPaths []string           `yaml:"protectedPaths"`
 }
 
-type Rule struct {
-	Path    string `yaml:"path"`
-	Match   string `yaml:"match"`
-	Profile string `yaml:"profile"`
+type GitHubAccessPolicy struct {
+	Paths          []string                   `yaml:"paths"`
+	Authentication GitHubAuthenticationPolicy `yaml:"authentication"`
+}
+
+type ProjectConfig struct {
+	Version   int              `yaml:"version"`
+	Backend   Backend          `yaml:"backend,omitempty"`
+	Network   string           `yaml:"network,omitempty"`
+	Workspace *WorkspacePolicy `yaml:"workspace,omitempty"`
+	Shares    []ProjectShare   `yaml:"shares,omitempty"`
 }
 
 type Profile struct {
-	Backend     Backend          `yaml:"backend"`
-	Network     string           `yaml:"network"`
-	Workspace   WorkspacePolicy  `yaml:"workspace"`
-	Credentials CredentialPolicy `yaml:"credentials"`
-	Resources   Resources        `yaml:"resources"`
-	VM          VMConfig         `yaml:"vm"`
+	Backend       Backend          `yaml:"backend"`
+	Network       string           `yaml:"network"`
+	Workspace     WorkspacePolicy  `yaml:"workspace"`
+	Tools         ToolPolicy       `yaml:"tools"`
+	Credentials   CredentialPolicy `yaml:"credentials"`
+	Resources     Resources        `yaml:"resources"`
+	VM            VMConfig         `yaml:"vm"`
+	ProjectShares []ProjectShare   `yaml:"-" json:"projectShares,omitempty"`
+}
+
+type ProjectShare struct {
+	Source  string   `yaml:"source" json:"source"`
+	Target  string   `yaml:"target" json:"target"`
+	Mode    string   `yaml:"mode" json:"mode"`
+	Access  string   `yaml:"access,omitempty" json:"access,omitempty"`
+	Exclude []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
+}
+
+type ToolPolicy struct {
+	Codex             ForwardedToolPolicy `yaml:"codex"`
+	Claude            ForwardedToolPolicy `yaml:"claude"`
+	GH                GitHubToolPolicy    `yaml:"gh"`
+	SharedDirectories []ForwardedPath     `yaml:"sharedDirectories"`
+}
+
+type ForwardedToolPolicy struct {
+	Enabled        bool            `yaml:"enabled"`
+	Authentication []ForwardedFile `yaml:"authentication"`
+	Configuration  []ForwardedFile `yaml:"configuration"`
+}
+
+type ForwardedFile struct {
+	Source   string `yaml:"source"`
+	Target   string `yaml:"target"`
+	Optional bool   `yaml:"optional,omitempty"`
+}
+
+type ForwardedPath struct {
+	Source   string   `yaml:"source"`
+	Target   string   `yaml:"target"`
+	Exclude  []string `yaml:"exclude,omitempty"`
+	Optional bool     `yaml:"optional,omitempty"`
+}
+
+type GitHubToolPolicy struct {
+	Enabled        bool                       `yaml:"enabled"`
+	Authentication GitHubAuthenticationPolicy `yaml:"authentication"`
+}
+
+type GitHubAuthenticationPolicy struct {
+	TokenCommand []string `yaml:"tokenCommand"`
 }
 
 type WorkspacePolicy struct {
@@ -48,8 +99,7 @@ type WorkspacePolicy struct {
 }
 
 type CredentialPolicy struct {
-	SSHKey             string   `yaml:"sshKey"`
-	GitHubTokenCommand []string `yaml:"githubTokenCommand"`
+	SSHKey string `yaml:"sshKey"`
 }
 
 type Resources struct {
@@ -68,27 +118,29 @@ type VMConfig struct {
 }
 
 type Resolved struct {
-	Config      Config
-	ProfileName string
-	Profile     Profile
-	Workspace   string
-	WorkingDir  string
-	Protected   []string
-	StateDir    string
+	Config            Config
+	ProfileName       string
+	Profile           Profile
+	ProjectConfigPath string
+	Workspace         string
+	WorkingDir        string
+	Protected         []string
+	StateDir          string
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Version:        1,
-		DefaultProfile: "default",
-		Profiles: map[string]Profile{
-			"default": {
-				Backend:   BackendBubblewrap,
-				Network:   "full",
-				Workspace: WorkspacePolicy{Mode: "live"},
-			},
+		Version: 3,
+		Defaults: Profile{
+			Backend:   BackendBubblewrap,
+			Network:   "full",
+			Workspace: WorkspacePolicy{Mode: "live"},
 		},
 	}
+}
+
+func DefaultProjectConfig() ProjectConfig {
+	return ProjectConfig{Version: 3}
 }
 
 func ConfigPath() (string, error) {
@@ -136,29 +188,115 @@ func LoadConfig(path string) (Config, error) {
 }
 
 func (cfg Config) Validate() error {
-	if cfg.Version != 1 {
-		return fmt.Errorf("unsupported config version %d (expected 1)", cfg.Version)
+	if cfg.Version != 3 {
+		return fmt.Errorf("unsupported config version %d (expected 3)", cfg.Version)
 	}
-	if len(cfg.Profiles) == 0 {
-		return errors.New("config must define at least one profile")
+	if err := cfg.Defaults.Validate(); err != nil {
+		return fmt.Errorf("defaults: %w", err)
 	}
-	if _, ok := cfg.Profiles[cfg.DefaultProfile]; !ok {
-		return fmt.Errorf("default profile %q is not defined", cfg.DefaultProfile)
+	if len(cfg.Defaults.Tools.GH.Authentication.TokenCommand) > 0 {
+		return errors.New("GitHub token authentication must use the top-level github path policy")
 	}
-	for name, profile := range cfg.Profiles {
-		if err := profile.Validate(); err != nil {
-			return fmt.Errorf("profile %q: %w", name, err)
+	if len(cfg.GitHub.Paths) != 0 && len(cfg.GitHub.Authentication.TokenCommand) == 0 {
+		return errors.New("github.paths requires github.authentication.tokenCommand")
+	}
+	if len(cfg.GitHub.Authentication.TokenCommand) != 0 && len(cfg.GitHub.Paths) == 0 {
+		return errors.New("GitHub authentication needs at least one trusted path")
+	}
+	if len(cfg.GitHub.Authentication.TokenCommand) > 0 && strings.TrimSpace(cfg.GitHub.Authentication.TokenCommand[0]) == "" {
+		return errors.New("github.authentication.tokenCommand must start with a command")
+	}
+	for _, path := range cfg.GitHub.Paths {
+		if strings.TrimSpace(path) == "" || strings.ContainsAny(path, "*?[]") || (!filepath.IsAbs(path) && path != "~" && !strings.HasPrefix(path, "~/")) {
+			return fmt.Errorf("github.paths entries must be absolute directory paths without glob patterns: %q", path)
 		}
 	}
-	for i, rule := range cfg.Rules {
-		if rule.Path == "" || rule.Profile == "" {
-			return fmt.Errorf("rule %d needs path and profile", i+1)
+	return nil
+}
+
+func ProjectConfigPath(workspace string) string {
+	return filepath.Join(workspace, ".devfence.yaml")
+}
+
+func LoadProjectConfig(workspace string) (ProjectConfig, string, error) {
+	path := ProjectConfigPath(workspace)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return DefaultProjectConfig(), "", nil
+	}
+	if err != nil {
+		return ProjectConfig{}, "", fmt.Errorf("read project config: %w", err)
+	}
+	var project ProjectConfig
+	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&project); err != nil {
+		return ProjectConfig{}, "", fmt.Errorf("parse project config: %w", err)
+	}
+	if err := project.Validate(); err != nil {
+		return ProjectConfig{}, "", err
+	}
+	return project, path, nil
+}
+
+func (project ProjectConfig) Validate() error {
+	if project.Version != 3 {
+		return fmt.Errorf("unsupported project config version %d (expected 3)", project.Version)
+	}
+	if project.Backend != "" {
+		switch project.Backend {
+		case BackendBubblewrap, BackendDocker, BackendVM:
+		default:
+			return fmt.Errorf("unsupported backend %q", project.Backend)
 		}
-		if _, ok := cfg.Profiles[rule.Profile]; !ok {
-			return fmt.Errorf("rule %d selects undefined profile %q", i+1, rule.Profile)
+	}
+	if project.Network != "" && project.Network != "full" && project.Network != "none" {
+		return fmt.Errorf("unsupported network mode %q", project.Network)
+	}
+	if project.Workspace != nil {
+		if project.Workspace.Mode != "" && project.Workspace.Mode != "live" && project.Workspace.Mode != "copy" {
+			return fmt.Errorf("unsupported workspace mode %q", project.Workspace.Mode)
 		}
-		if rule.Match != "" && rule.Match != "exact" && rule.Match != "subtree" {
-			return fmt.Errorf("rule %d has unsupported match mode %q", i+1, rule.Match)
+		for _, pattern := range append(append([]string{}, project.Workspace.Include...), project.Workspace.Exclude...) {
+			if err := validatePattern(pattern); err != nil {
+				return err
+			}
+		}
+	}
+	if err := validateProjectShares(project.Shares); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateProjectShares(shares []ProjectShare) error {
+	for index, share := range shares {
+		label := fmt.Sprintf("shares[%d]", index)
+		if strings.TrimSpace(share.Source) == "" {
+			return fmt.Errorf("%s.source is required", label)
+		}
+		if err := validateForwardedFileTarget(share.Target); err != nil {
+			return fmt.Errorf("%s.target: %w", label, err)
+		}
+		switch share.Mode {
+		case "copy":
+			if share.Access != "" {
+				return fmt.Errorf("%s.access applies only to live mounts", label)
+			}
+		case "mount":
+			if share.Access != "" && share.Access != "read-only" && share.Access != "read-write" {
+				return fmt.Errorf("%s.access must be read-only or read-write", label)
+			}
+			if len(share.Exclude) != 0 {
+				return fmt.Errorf("%s.exclude is only supported for copied shares", label)
+			}
+		default:
+			return fmt.Errorf("%s.mode must be copy or mount", label)
+		}
+		for _, excluded := range share.Exclude {
+			if err := validateForwardedExclusion(excluded); err != nil {
+				return fmt.Errorf("%s.exclude: %w", label, err)
+			}
 		}
 	}
 	return nil
@@ -193,11 +331,98 @@ func (p Profile) Validate() error {
 	if p.Backend == BackendVM && p.Network == "none" {
 		return errors.New("the VM backend needs network access for SSH management; network: none is unsupported")
 	}
+	var forwardedTargets []string
+	for name, tool := range map[string]ForwardedToolPolicy{"codex": p.Tools.Codex, "claude": p.Tools.Claude} {
+		files := append(append([]ForwardedFile(nil), tool.Authentication...), tool.Configuration...)
+		if !tool.Enabled && len(files) > 0 {
+			return fmt.Errorf("tools.%s must be enabled to forward authentication or configuration files", name)
+		}
+		for _, file := range files {
+			if strings.TrimSpace(file.Source) == "" {
+				return fmt.Errorf("tools.%s forwarded files need a source path", name)
+			}
+			if err := validateForwardedFileTarget(file.Target); err != nil {
+				return fmt.Errorf("tools.%s: %w", name, err)
+			}
+			forwardedTargets = append(forwardedTargets, file.Target)
+		}
+	}
+	for _, path := range p.Tools.SharedDirectories {
+		if strings.TrimSpace(path.Source) == "" {
+			return errors.New("tools.sharedDirectories entries need a source path")
+		}
+		if err := validateForwardedFileTarget(path.Target); err != nil {
+			return fmt.Errorf("tools.sharedDirectories: %w", err)
+		}
+		for _, excluded := range path.Exclude {
+			if err := validateForwardedExclusion(excluded); err != nil {
+				return fmt.Errorf("tools.sharedDirectories exclusion: %w", err)
+			}
+		}
+		forwardedTargets = append(forwardedTargets, path.Target)
+	}
+	if err := validateProjectShares(p.ProjectShares); err != nil {
+		return err
+	}
+	for _, share := range p.ProjectShares {
+		if p.Backend == BackendDocker && (strings.Contains(share.Source, ",") || strings.Contains(share.Target, ",")) {
+			return fmt.Errorf("Docker project share paths cannot contain commas: %q -> %q", share.Source, share.Target)
+		}
+		if p.Backend == BackendVM && share.Mode == "mount" {
+			if strings.Contains(share.Source, ",") {
+				return fmt.Errorf("VM virtiofs share source paths cannot contain commas: %q", share.Source)
+			}
+			if strings.ContainsAny(share.Target, ",:# \t\r\n") {
+				return fmt.Errorf("VM live mount targets cannot contain commas, colons, whitespace, or #: %q", share.Target)
+			}
+		}
+		forwardedTargets = append(forwardedTargets, share.Target)
+	}
+	for _, target := range forwardedTargets {
+		clean := filepath.Clean(filepath.FromSlash(target))
+		if clean == ".devfence" || within(".devfence", clean) {
+			return fmt.Errorf("forwarded tool target %q uses Devfence's reserved .devfence directory", target)
+		}
+	}
+	for i, first := range forwardedTargets {
+		first = filepath.Clean(filepath.FromSlash(first))
+		for _, second := range forwardedTargets[i+1:] {
+			second = filepath.Clean(filepath.FromSlash(second))
+			if within(first, second) || within(second, first) {
+				return fmt.Errorf("forwarded tool targets overlap: %q and %q", first, second)
+			}
+		}
+	}
+	if len(p.Tools.GH.Authentication.TokenCommand) > 0 && strings.TrimSpace(p.Tools.GH.Authentication.TokenCommand[0]) == "" {
+		return errors.New("tools.gh.authentication.tokenCommand must start with a command")
+	}
+	if len(p.Tools.GH.Authentication.TokenCommand) > 0 && !p.Tools.GH.Enabled {
+		return errors.New("tools.gh must be enabled to forward GitHub authentication")
+	}
 	if p.Resources.MemoryMiB < 0 || p.Resources.VCPUs < 0 || p.Resources.DiskGiB < 0 {
 		return errors.New("resource limits cannot be negative")
 	}
-	if len(p.Credentials.GitHubTokenCommand) > 0 && strings.TrimSpace(p.Credentials.GitHubTokenCommand[0]) == "" {
-		return errors.New("githubTokenCommand must start with a command")
+	return nil
+}
+
+func validateForwardedFileTarget(target string) error {
+	if target == "" || filepath.IsAbs(target) {
+		return fmt.Errorf("forwarded file target must be a non-empty relative path: %q", target)
+	}
+	clean := filepath.Clean(filepath.FromSlash(target))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("forwarded file target escapes the tool's home directory: %q", target)
+	}
+	return nil
+}
+
+func validateForwardedExclusion(excluded string) error {
+	if excluded == "" || filepath.IsAbs(excluded) || strings.ContainsAny(excluded, "*?[]") {
+		return fmt.Errorf("must be a relative path without glob patterns: %q", excluded)
+	}
+	clean := filepath.Clean(filepath.FromSlash(excluded))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("must stay inside the forwarded directory: %q", excluded)
 	}
 	return nil
 }
@@ -213,7 +438,7 @@ func validatePattern(pattern string) error {
 	return nil
 }
 
-func Resolve(cfg Config, cwd, backendOverride, workspaceOverride, networkOverride, profileOverride string) (Resolved, error) {
+func Resolve(cfg Config, cwd, backendOverride, workspaceOverride, networkOverride string) (Resolved, error) {
 	if err := cfg.Validate(); err != nil {
 		return Resolved{}, err
 	}
@@ -236,34 +461,23 @@ func Resolve(cfg Config, cwd, backendOverride, workspaceOverride, networkOverrid
 		return Resolved{}, err
 	}
 
-	profileName := cfg.DefaultProfile
-	if profileOverride != "" {
-		if _, ok := cfg.Profiles[profileOverride]; !ok {
-			return Resolved{}, fmt.Errorf("profile %q is not defined", profileOverride)
-		}
-		profileName = profileOverride
-	} else {
-		for _, rule := range cfg.Rules {
-			base, err := expandPath(rule.Path)
-			if err != nil {
-				return Resolved{}, fmt.Errorf("rule path %q: %w", rule.Path, err)
-			}
-			base, err = canonicalExistingOrClean(base)
-			if err != nil {
-				return Resolved{}, err
-			}
-			match := rule.Match
-			if match == "" {
-				match = "subtree"
-			}
-			if match == "exact" && workspace == base || match == "subtree" && within(base, workspace) {
-				profileName = rule.Profile
-				break
-			}
-		}
+	projectConfig, projectConfigPath, err := LoadProjectConfig(workspace)
+	if err != nil {
+		return Resolved{}, err
 	}
-
-	profile := cfg.Profiles[profileName]
+	profile := applyProjectConfig(cfg.Defaults, projectConfig)
+	profile.ProjectShares, err = resolveProjectShares(projectConfig.Shares, workspace)
+	if err != nil {
+		return Resolved{}, err
+	}
+	profileName := "default"
+	if projectConfigPath != "" {
+		profileName = filepath.Base(workspace)
+	}
+	profile.Tools.GH, err = githubPolicyForWorkspace(cfg.GitHub, workspace, profile.Tools.GH.Enabled)
+	if err != nil {
+		return Resolved{}, err
+	}
 	if backendOverride != "" {
 		profile.Backend = Backend(backendOverride)
 	}
@@ -297,14 +511,141 @@ func Resolve(cfg Config, cwd, backendOverride, workspaceOverride, networkOverrid
 		}
 		protected = append(protected, resolved)
 	}
+	for _, share := range profile.ProjectShares {
+		for _, protectedPath := range protected {
+			if within(protectedPath, share.Source) || within(share.Source, protectedPath) {
+				return Resolved{}, fmt.Errorf("project share source %s overlaps protected path %s", share.Source, protectedPath)
+			}
+		}
+	}
 	stateDir, err := StatePath()
+	if err != nil {
+		return Resolved{}, err
+	}
+	stateDir, err = canonicalExistingOrClean(stateDir)
 	if err != nil {
 		return Resolved{}, err
 	}
 	if within(workspace, stateDir) || within(stateDir, workspace) {
 		return Resolved{}, errors.New("workspace and Devfence state directory must not overlap; set XDG_STATE_HOME elsewhere")
 	}
-	return Resolved{Config: cfg, ProfileName: profileName, Profile: profile, Workspace: workspace, WorkingDir: workingDir, Protected: protected, StateDir: stateDir}, nil
+	for _, share := range profile.ProjectShares {
+		if within(stateDir, share.Source) || within(share.Source, stateDir) {
+			return Resolved{}, fmt.Errorf("project share source %s overlaps Devfence state directory %s", share.Source, stateDir)
+		}
+		if err := validateProjectShareSource(share.Source); err != nil {
+			return Resolved{}, err
+		}
+	}
+	return Resolved{
+		Config: cfg, ProfileName: profileName, Profile: profile,
+		ProjectConfigPath: projectConfigPath, Workspace: workspace,
+		WorkingDir: workingDir, Protected: protected, StateDir: stateDir,
+	}, nil
+}
+
+func applyProjectConfig(profile Profile, project ProjectConfig) Profile {
+	if project.Backend != "" {
+		profile.Backend = project.Backend
+	}
+	if project.Network != "" {
+		profile.Network = project.Network
+	}
+	if project.Workspace != nil {
+		if project.Workspace.Mode != "" {
+			profile.Workspace.Mode = project.Workspace.Mode
+		}
+		if project.Workspace.Include != nil {
+			profile.Workspace.Include = project.Workspace.Include
+		}
+		if project.Workspace.Exclude != nil {
+			profile.Workspace.Exclude = project.Workspace.Exclude
+		}
+	}
+	profile.ProjectShares = append([]ProjectShare(nil), project.Shares...)
+	return profile
+}
+
+func resolveProjectShares(shares []ProjectShare, workspace string) ([]ProjectShare, error) {
+	resolved := append([]ProjectShare(nil), shares...)
+	for index := range resolved {
+		share := &resolved[index]
+		source := share.Source
+		if !filepath.IsAbs(source) && source != "~" && !strings.HasPrefix(source, "~/") {
+			source = filepath.Join(workspace, source)
+		}
+		expanded, err := expandPath(source)
+		if err != nil {
+			return nil, fmt.Errorf("shares[%d].source: %w", index, err)
+		}
+		canonical, err := filepath.EvalSymlinks(expanded)
+		if err != nil {
+			return nil, fmt.Errorf("shares[%d].source: %w", index, err)
+		}
+		info, err := os.Stat(canonical)
+		if err != nil {
+			return nil, fmt.Errorf("shares[%d].source: %w", index, err)
+		}
+		if info.IsDir() {
+			share.Source = filepath.Clean(canonical)
+		} else if info.Mode().IsRegular() {
+			if share.Mode == "mount" {
+				return nil, fmt.Errorf("shares[%d]: live mounts must refer to directories", index)
+			}
+			if len(share.Exclude) > 0 {
+				return nil, fmt.Errorf("shares[%d].exclude requires a directory source", index)
+			}
+			share.Source = filepath.Clean(canonical)
+		} else {
+			return nil, fmt.Errorf("shares[%d].source must be a regular file or directory", index)
+		}
+		if share.Mode == "mount" && share.Access == "" {
+			share.Access = "read-only"
+		}
+	}
+	return resolved, nil
+}
+
+func validateProjectShareSource(source string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	blockedRoots := []string{"/", "/home", "/tmp", "/var/tmp", "/run", "/proc", "/sys", "/dev"}
+	for _, blocked := range blockedRoots {
+		if source == blocked || within(source, blocked) {
+			return fmt.Errorf("project share source %s is too broad; choose a specific file or directory", source)
+		}
+		if blocked == "/run" || blocked == "/proc" || blocked == "/sys" || blocked == "/dev" {
+			if within(blocked, source) {
+				return fmt.Errorf("project share source %s is under protected system path %s", source, blocked)
+			}
+		}
+	}
+	if source == home || within(source, home) {
+		return fmt.Errorf("project share source %s is too broad; choose a specific file or directory under the home directory", source)
+	}
+	return nil
+}
+
+func githubPolicyForWorkspace(policy GitHubAccessPolicy, workspace string, cliEnabled bool) (GitHubToolPolicy, error) {
+	if len(policy.Authentication.TokenCommand) == 0 {
+		return GitHubToolPolicy{Enabled: cliEnabled}, nil
+	}
+	for _, path := range policy.Paths {
+		root, err := expandPath(path)
+		if err != nil {
+			return GitHubToolPolicy{}, fmt.Errorf("GitHub path %q: %w", path, err)
+		}
+		root, err = canonicalExistingOrClean(root)
+		if err != nil {
+			return GitHubToolPolicy{}, fmt.Errorf("GitHub path %q: %w", path, err)
+		}
+		if within(root, workspace) {
+			return GitHubToolPolicy{Enabled: true, Authentication: policy.Authentication}, nil
+		}
+	}
+	return GitHubToolPolicy{Enabled: cliEnabled}, nil
 }
 
 func validateWorkspaceRoot(workspace string) error {

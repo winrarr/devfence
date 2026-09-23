@@ -1,12 +1,16 @@
-version: 1
-defaultProfile: vm-smoke
-profiles:
-  vm-smoke:
-    backend: vm
-    network: full
-    workspace:
-      mode: live
-    resources:
-      memoryMiB: 6144
-      vcpus: 4
-      diskGiB: 40
+version: 3
+defaults:
+  backend: vm
+  network: full
+  workspace:
+    mode: live
+  tools:
+    codex:
+      enabled: true
+      configuration:
+        - source: GLOBAL_INSTRUCTIONS_PATH
+          target: .codex/AGENTS.md
+  resources:
+    memoryMiB: 6144
+    vcpus: 4
+    diskGiB: 40

@@ -15,7 +15,13 @@ import (
 
 var sshAgentPIDPattern = regexp.MustCompile(`SSH_AGENT_PID=([0-9]+)`)
 
-func prepareCredentials(session *Session, policy CredentialPolicy) error {
+func prepareCredentials(session *Session, profile Profile) error {
+	if session.Status == "starting" {
+		if err := prepareForwardedTools(session, profile); err != nil {
+			return err
+		}
+	}
+	policy := profile.Credentials
 	if policy.SSHKey != "" {
 		if err := ensureSSHAgent(session, policy.SSHKey); err != nil {
 			return err
@@ -26,8 +32,9 @@ func prepareCredentials(session *Session, policy CredentialPolicy) error {
 		session.SSHKeyName = ""
 		session.SSHKeyFingerprint = ""
 	}
-	if len(policy.GitHubTokenCommand) > 0 {
-		if err := retrieveGitHubToken(session, policy.GitHubTokenCommand); err != nil {
+	tokenCommand := profile.Tools.GH.Authentication.TokenCommand
+	if len(tokenCommand) > 0 {
+		if err := retrieveGitHubToken(session, tokenCommand); err != nil {
 			return err
 		}
 		session.GitHubEnabled = true
